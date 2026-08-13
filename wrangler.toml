@@ -1,5 +1,5 @@
 # wrangler.toml
-name = "crl-updater"
+name = "crl-checker"
 main = "worker-crl-updater.js"
 compatibility_date = "2024-01-01"
 
