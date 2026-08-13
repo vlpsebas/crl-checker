@@ -10,7 +10,7 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["CRLProcessor"]
+new_sqlite_classes = ["CRLProcessor"]
 
 [[kv_namespaces]]
 binding = "REVOKED_CERTS"
