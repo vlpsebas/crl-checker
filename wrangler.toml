@@ -1,0 +1,21 @@
+# wrangler.toml
+name = "crl-updater"
+main = "worker-crl-updater.js"
+compatibility_date = "2024-01-01"
+
+[durable_objects]
+bindings = [
+  { name = "CRL_PROCESSOR", class_name = "CRLProcessor" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CRLProcessor"]
+
+[[kv_namespaces]]
+binding = "REVOKED_CERTS"
+id = "9c8286c0aa9d4267b832e46b1b4edd02"
+
+[[kv_namespaces]]
+binding = "CA_STORE"
+id = "58b807a68fa643bbafb31f54d07a3af4"
