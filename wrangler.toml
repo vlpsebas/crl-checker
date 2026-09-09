@@ -7,6 +7,10 @@ compatibility_date = "2024-11-01"
 binding = "REVOKED_CERTS"
 id = "9c8286c0aa9d4267b832e46b1b4edd02"
 
+[[kv_namespaces]]
+binding = "CRL_DATA"
+id = "64b52e5fd5f24b2e9042a6c3dbe9ab27"
+
 # Durable Object: assembles chunked CRL uploads (only needed for CRLs > request body limit)
 [durable_objects]
 bindings = [{ name = "CRL_PROCESSOR", class_name = "CRLProcessor" }]
