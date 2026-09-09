@@ -1,49 +1,4 @@
 name = "crl-checker-demo"
-main = "index.js"
-compatibility_date = "2024-11-01"
-
-# KV shared by validator + importer. Create: wrangler kv namespace create REVOKED_CERTS
-[[kv_namespaces]]
-binding = "REVOKED_CERTS"
-id = "9c8286c0aa9d4267b832e46b1b4edd02"
-
-[[kv_namespaces]]
-binding = "CRL_DATA"
-id = "64b52e5fd5f24b2e9042a6c3dbe9ab27"
-
-# Durable Object: assembles chunked CRL uploads (only needed for CRLs > request body limit)
-[durable_objects]
-bindings = [{ name = "CRL_PROCESSOR", class_name = "CRLProcessor" }]
-
-[[migrations]]
-tag = "v1"
-new_classes = ["CRLProcessor"]
-
-# Twice daily: 06:00 and 18:00 UTC (morning + night refresh)
-[triggers]
-crons = ["0 6,18 * * *"]
-
-[vars]
-CRL_ORIGIN_URL = "https://your-crl-source.example.com/crl.pem"
-CRL_FORMAT = "pem"
-# Fail-closed staleness: block requests when CRL older than this, or past nextUpdate
-CRL_MAX_AGE_HOURS = "24"
-# Set to "true" to enable per-request usage counters (pricing data) — off by default
-TELEMETRY = "true"
-
-# Admin auth: set with `wrangler secret put ADMIN_SECRET` (do NOT put secrets in vars)
-
-# Optional: R2 bucket for CRL storage (uncomment to use R2 instead of HTTP fetch)
-# [[r2_buckets]]
-# binding = "CRL_BUCKET"
-# bucket_name = "crl-storage"
-
-
-
-
-
-
-name = "crl-checker-demo"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
