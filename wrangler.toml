@@ -1,21 +1,30 @@
-# wrangler.toml
-name = "crl-checker"
-main = "worker-crl-updater.js"
-compatibility_date = "2024-01-01"
+# CRL Importer Worker
+# Chunked CRL uploads via Durable Objects; publishes revoked serials to KV.
+#
+# Deploy:      wrangler deploy
+# Local dev:   wrangler dev --remote   (DO + KV need --remote or wrangler dev's local emulation)
 
+name = "crl-importer"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# KV namespace shared with the mTLS Ingress Worker.
+# Create it with:  wrangler kv namespace create REVOKED_CERTS
+[[kv_namespaces]]
+binding = "REVOKED_CERTS"
+id = "9c8286c0aa9d4267b832e46b1b4edd02"
+
+# Durable Object that assembles chunked uploads
 [durable_objects]
 bindings = [
   { name = "CRL_PROCESSOR", class_name = "CRLProcessor" }
 ]
 
+# Plain JS DO -> new_classes (NOT new_sqlite_classes, which is only for
+# D1-backed DOs). The original upload used new_sqlite_classes; that was wrong.
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["CRLProcessor"]
+new_classes = ["CRLProcessor"]
 
-[[kv_namespaces]]
-binding = "REVOKED_CERTS"
-id = "9c8286c0aa9d4267b832e46b1b4edd02"
-
-[[kv_namespaces]]
-binding = "CA_STORE"
-id = "58b807a68fa643bbafb31f54d07a3af4"
+# Optional admin auth. Set with:  wrangler secret put ADMIN_SECRET
+# Do NOT put secrets in [vars] — they get baked into the deployed bundle.
