@@ -1,13 +1,25 @@
 // importer.js — CRL import & parse for crl-checker.
-// ONE module handles every import path (no separate files needed):
-//   - POST /crl/import            manual run (body: { url?, format? })
-//   - POST /crl/fetch             pull CRL from a URL (e.g. mock origin worker)
-//   - POST /crl/upload/*          chunked upload via Durable Object (large CRLs)
-//   - scheduled (cron, 2x daily)  same runImport() as manual
-// Parsing on a schedule costs nothing on the request path: cron invocations are
-// separate billable events, so import CPU never slows down client requests.
+// ONE module handles every import path:
+//   - POST /crl/import        manual run (body: { url?, format? }) — same as cron
+//   - POST /crl/fetch         pull CRL from a URL via Range requests, assembled
+//                             inside the Durable Object — handles any size
+//   - POST /crl/upload        single streaming upload (≤100MB body). The Worker
+//                             forwards the raw body stream to the DO, which slices
+//                             it internally. The client sends ONE request — there
+//                             is NO manual chunking protocol.
+//   - scheduled (cron)        runImport() — same as manual
+//
+// Why a DO: a >100MB CRL cannot ride in a single HTTP request. The DO assembles
+// it server-side, piece by piece. Platform constraints honored here:
+//   - DO storage value limit: 128 KiB  → internal slices are 96 KiB
+//   - KV value limit: 25 MB            → crl:current is skipped above ~20 MB
+//                                        (per-serial keys are always written; the
+//                                        validator only needs serial:<hex>)
 
 import { json, fail, normSerial, bump, authorized } from "./admin.js";
+
+const SLICE = 96 * 1024; // < 128 KiB DO storage value cap
+const KV_CURRENT_MAX = 20 * 1024 * 1024; // headroom under KV's 25 MB value cap
 
 // ---------- PEM / DER helpers ----------
 const ascii = (bytes) => { let s = ""; for (const b of bytes) s += String.fromCharCode(b); return s; };
@@ -16,7 +28,7 @@ const b64ToBuf = (b64) => {
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
   return u.buffer;
 };
-const pemToDER = (pem) => {
+export const pemToDER = (pem) => {
   const b64 = pem.replace(/-----BEGIN [^-]+-----/g, "").replace(/-----END [^-]+-----/g, "").replace(/\s+/g, "");
   if (!b64) throw new Error("no base64 payload found in PEM");
   return new Uint8Array(b64ToBuf(b64));
@@ -24,6 +36,10 @@ const pemToDER = (pem) => {
 const sha256Hex = async (bytes) =>
   [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
     .map((b) => b.toString(16).padStart(2, "0")).join("");
+export const detectFormat = (bytes) => {
+  const head = new TextDecoder().decode(bytes.slice(0, 4096));
+  return head.includes("BEGIN") ? "pem" : "der";
+};
 
 // ---------- minimal ASN.1 DER parser (CertificateList) ----------
 // CertificateList ::= SEQUENCE { tbsCertList, sigAlg, sig }
@@ -42,7 +58,7 @@ const intToHex = (v) => {
   let h = ""; for (const b of v) h += b.toString(16).padStart(2, "0");
   return h.replace(/^(00)+/, "") || "0"; // strip positive-INTEGER padding
 };
-function parseCRL(der) {
+export function parseCRL(der) {
   const root = parseTLV(der, 0);
   if (root.tag !== 0x30 || root.children.length < 1) throw new Error("not a DER SEQUENCE — is this actually a CRL?");
   const tbs = root.children[0];
@@ -82,89 +98,141 @@ export async function publish(kv, der, source, format) {
     this_update: parseASN1Time(thisUpdate),
   };
   const currentJson = JSON.stringify(serials);
-  await kv.put("crl:current", currentJson);
+  let writes = 0;
+  if (currentJson.length <= KV_CURRENT_MAX) {
+    await kv.put("crl:current", currentJson);
+    writes++;
+  } else {
+    // too big for a KV value — keep per-serial keys only (validator doesn't need crl:current)
+    meta.crl_current_overflow = true;
+    meta.crl_current_bytes = currentJson.length;
+  }
   await kv.put("crl:current:meta", JSON.stringify(meta));
-  await kv.put("crl:version", sha);
-  for (const s of serials) await kv.put("serial:" + normSerial(s), "revoked");
-  // prune serials from previous imports that are no longer revoked
+  writes++;
+  for (const s of serials) { await kv.put("serial:" + normSerial(s), "revoked"); }
+  writes += serials.length;
+
+  // prune serial:* entries no longer revoked (bounded)
   const cur = new Set(serials.map(normSerial));
-  const listed = await kv.list({ prefix: "serial:" });
-  let pruned = 0;
-  for (const k of listed.keys) if (!cur.has(k.name.slice(7))) { await kv.delete(k.name); pruned++; }
+  let pruned = 0, cursor = null;
+  do {
+    const opts = { prefix: "serial:" };
+    if (cursor) opts.cursor = cursor;
+    const listed = await kv.list(opts);
+    for (const k of listed.keys) if (!cur.has(k.name.slice(7))) { await kv.delete(k.name); pruned++; }
+    cursor = listed.list_complete ? null : listed.cursor;
+    if (pruned > 20000) break; // safety cap
+  } while (cursor);
+
   await kv.put("crl:status", JSON.stringify({ last_success: new Date().toISOString(), last_error: null, serial_count: serials.length }));
+  writes++;
   const ms = Date.now() - t0;
-  await bump(kv, { kv_writes: 3 + serials.length + pruned, kv_reads: 1, kv_bytes: currentJson.length + JSON.stringify(meta).length, cpu_ms: ms });
-  return { ok: true, serial_count: serials.length, checksum: sha, expiry: meta.expiry, cpu_ms: ms };
+  await bump(kv, { kv_writes: writes, kv_reads: 1, kv_bytes: currentJson.length + JSON.stringify(meta).length, cpu_ms: ms });
+  return { ok: true, serial_count: serials.length, checksum: sha, expiry: meta.expiry, cpu_ms: ms, crl_current_stored: !meta.crl_current_overflow };
 }
 
-// ---------- runImport: used by cron + POST /crl/import + POST /crl/fetch ----------
+// ---------- runImport: cron + POST /crl/import (small/medium CRLs) ----------
+// For very large CRLs use POST /crl/fetch instead (DO Range-paged assembly).
 export async function runImport(env, { url, format } = {}) {
   const crlUrl = url || env.CRL_ORIGIN_URL;
   if (!crlUrl) throw new Error("no CRL source URL (set CRL_ORIGIN_URL or pass url)");
   const res = await fetch(crlUrl);
   if (!res.ok) throw new Error("CRL source returned " + res.status);
   const bytes = new Uint8Array(await res.arrayBuffer());
-  const fmt = format || env.CRL_FORMAT || "pem";
-  const der = fmt === "der" ? bytes : pemToDER(new TextDecoder().decode(bytes));
+  const fmt = format || env.CRL_FORMAT || "auto";
+  const der = fmt === "der" ? bytes : (fmt === "auto" && detectFormat(bytes) === "der") ? bytes : pemToDER(new TextDecoder().decode(bytes));
   return await publish(env.REVOKED_CERTS, der, crlUrl, fmt);
 }
 
-// ---------- chunked upload via Durable Object (large CRLs) ----------
+// ---------- Durable Object: server-side assembly (no client chunking) ----------
 export class CRLProcessor {
   constructor(state, env) { this.state = state; this.env = env; }
+
   async fetch(request) {
     const url = new URL(request.url); const path = url.pathname;
     try {
-      if (request.method === "POST" && path === "/start") {
-        const { totalChunks, format } = await request.json();
-        if (!totalChunks || totalChunks < 1 || totalChunks > 10000) return fail("totalChunks must be 1..10000", 400);
-        await this.state.storage.put("meta", { totalChunks, format: format === "der" ? "der" : "pem", received: 0 });
-        return json({ ok: true });
+      // POST /fetch — Range-paged URL import (any size)
+      if (path === "/fetch" && request.method === "POST") {
+        const { url: crlUrl, format } = await request.json();
+        if (!crlUrl) return fail("url required", 400);
+        return await this.importFromUrl(crlUrl, format || "auto");
       }
-      if (request.method === "POST" && path === "/chunk") {
-        const meta = await this.state.storage.get("meta");
-        if (!meta) return fail("session not started", 400);
-        let index, data;
-        const idx = request.headers.get("X-Chunk-Index");
-        if (idx) { index = +idx; data = await request.arrayBuffer(); }
-        else { const b = await request.json(); index = b.index; data = b64ToBuf(b.data); }
-        if (isNaN(index) || index < 0 || index >= meta.totalChunks) return fail("bad chunk index " + index, 400);
-        if (!(await this.state.storage.get("have:" + index))) {
-          await this.state.storage.put("chunk:" + index, data);
-          await this.state.storage.put("have:" + index, 1);
-          meta.received++; await this.state.storage.put("meta", meta);
-        }
-        return json({ ok: true, received: meta.received, total: meta.totalChunks });
-      }
-      if (request.method === "POST" && path === "/complete") {
-        const meta = await this.state.storage.get("meta");
-        if (!meta) return fail("session not started", 400);
-        if (meta.received !== meta.totalChunks) return fail("incomplete: " + meta.received + "/" + meta.totalChunks, 409);
-        const parts = []; let total = 0;
-        for (let i = 0; i < meta.totalChunks; i++) {
-          const c = await this.state.storage.get("chunk:" + i);
-          if (!c) return fail("missing chunk " + i, 409);
-          parts.push(c); total += c.byteLength;
-        }
-        const assembled = new Uint8Array(total); let off = 0;
-        for (const p of parts) { assembled.set(new Uint8Array(p), off); off += p.byteLength; }
-        const der = meta.format === "der" ? assembled : pemToDER(new TextDecoder().decode(assembled));
-        const result = await publish(this.env.REVOKED_CERTS, der, "manual-upload", meta.format);
-        for (let i = 0; i < meta.totalChunks; i++) { await this.state.storage.delete("chunk:" + i); await this.state.storage.delete("have:" + i); }
-        await this.state.storage.delete("meta");
-        return json(result);
-      }
-      if (request.method === "POST" && path === "/abort") {
-        const meta = await this.state.storage.get("meta");
-        if (meta) for (let i = 0; i < meta.totalChunks; i++) { await this.state.storage.delete("chunk:" + i); await this.state.storage.delete("have:" + i); }
-        await this.state.storage.delete("meta");
-        return json({ ok: true });
-      }
-      if (request.method === "GET" && path === "/status") {
-        return json({ ok: true, session: await this.state.storage.get("meta") });
+      // POST /upload — single streaming body; sliced internally
+      if (path === "/upload" && request.method === "POST") {
+        return await this.importFromStream(request.body, request.headers.get("x-crl-format") || "auto");
       }
       return fail("unknown DO action", 404);
     } catch (e) { return fail(e.message, 500); }
+  }
+
+  async storeSplit(buf) {
+    const u8 = new Uint8Array(buf);
+    for (let i = 0; i < u8.length; i += SLICE) {
+      await this.state.storage.put("piece:" + this.pieceIndex++, u8.slice(i, i + SLICE));
+    }
+    await this.state.storage.put("count", this.pieceIndex);
+  }
+
+  async importFromUrl(crlUrl, fmt) {
+    this.pieceIndex = 0;
+    let offset = 0;
+    while (true) {
+      const end = offset + SLICE - 1;
+      const res = await fetch(crlUrl, { headers: { Range: `bytes=${offset}-${end}` } });
+      if (res.status === 416) break; // requested past EOF
+      if (!res.ok) throw new Error("CRL source returned " + res.status);
+      const buf = await res.arrayBuffer();
+      if (res.status === 206) {
+        await this.storeSplit(buf);
+        if (buf.byteLength < SLICE) break;
+        const cr = res.headers.get("content-range");
+        const m = cr && cr.match(/\/(\d+)$/);
+        if (m && offset + buf.byteLength >= +m[1]) break;
+        offset += buf.byteLength;
+      } else {
+        // 200: server ignored Range → this is the whole body
+        await this.storeSplit(buf);
+        break;
+      }
+    }
+    return await this.assembleAndPublish(fmt, crlUrl);
+  }
+
+  async importFromStream(stream, fmt) {
+    this.pieceIndex = 0;
+    const reader = stream.getReader();
+    let buffer = new Uint8Array(0);
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const combined = new Uint8Array(buffer.length + value.length);
+      combined.set(buffer); combined.set(value, buffer.length);
+      buffer = combined;
+      if (buffer.length >= SLICE) {
+        await this.storeSplit(buffer);
+        buffer = new Uint8Array(0);
+      }
+    }
+    if (buffer.length) await this.storeSplit(buffer);
+    return await this.assembleAndPublish(fmt, "manual-upload");
+  }
+
+  async assembleAndPublish(fmt, source) {
+    const count = (await this.state.storage.get("count")) || 0;
+    const parts = []; let total = 0;
+    for (let i = 0; i < count; i++) {
+      const p = await this.state.storage.get("piece:" + i);
+      if (!p) throw new Error("missing piece " + i);
+      parts.push(p); total += p.byteLength;
+    }
+    const assembled = new Uint8Array(total); let off = 0;
+    for (const p of parts) { assembled.set(new Uint8Array(p), off); off += p.byteLength; }
+    const f = fmt === "auto" ? detectFormat(assembled) : fmt;
+    const der = f === "der" ? assembled : pemToDER(new TextDecoder().decode(assembled));
+    const result = await publish(this.env.REVOKED_CERTS, der, source, f);
+    for (let i = 0; i < count; i++) await this.state.storage.delete("piece:" + i);
+    await this.state.storage.delete("count");
+    return json(result);
   }
 }
 
@@ -176,29 +244,28 @@ export async function handleImport(request, env) {
     return fail("unauthorized", 401);
   }
 
-  // chunked upload session
-  if (path.startsWith("/crl/upload/")) {
-    const parts = path.split("/"); // ["", "crl", "upload", action, sessionId?]
-    const action = parts[3]; const sid = parts[4];
-    const stub = () => env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid));
-    if (action === "start") {
-      const body = await request.json();
-      const sid2 = crypto.randomUUID();
-      const r = await env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid2)).fetch("https://do/start", { method: "POST", body: JSON.stringify(body), headers: { "content-type": "application/json" } });
-      if (!r.ok) return r;
-      return json({ ok: true, sessionId: sid2 });
-    }
-    if (!sid) return fail("missing session id", 400);
-    if (action === "chunk") {
-      const headers = { "content-type": request.headers.get("content-type") || "application/octet-stream" };
-      const idx = request.headers.get("X-Chunk-Index");
-      if (idx) headers["x-chunk-index"] = idx;
-      return stub().fetch("https://do/chunk", { method: "POST", headers, body: await request.arrayBuffer() });
-    }
-    if (action === "complete") return stub().fetch("https://do/complete", { method: "POST" });
-    if (action === "abort") return stub().fetch("https://do/abort", { method: "POST" });
-    if (action === "status") return stub().fetch("https://do/status", { method: "GET" });
-    return fail("unknown upload action", 404);
+  // POST /crl/upload — ONE request, raw CRL file body (≤100MB). No client chunking:
+  // the Worker forwards the body stream to the DO, which slices it internally.
+  if (path === "/crl/upload" && request.method === "POST") {
+    const sid = crypto.randomUUID();
+    const stub = env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid));
+    const headers = { "content-type": "application/octet-stream" };
+    const fmt = url.searchParams.get("format"); // ?format=pem|der|auto (default auto)
+    if (fmt) headers["x-crl-format"] = fmt;
+    return await stub.fetch("https://do/upload", { method: "POST", headers, body: request.body });
+  }
+
+  // POST /crl/fetch — Range-paged URL import, assembled in the DO (any size)
+  if (path === "/crl/fetch" && request.method === "POST") {
+    const { url: u, format } = await request.json();
+    if (!u) return fail("url required", 400);
+    const sid = crypto.randomUUID();
+    const stub = env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid));
+    return await stub.fetch("https://do/fetch", {
+      method: "POST",
+      body: JSON.stringify({ url: u, format: format || "auto" }),
+      headers: { "content-type": "application/json" },
+    });
   }
 
   // POST /crl/import — manual run (cron calls runImport directly)
@@ -207,15 +274,6 @@ export async function handleImport(request, env) {
       const body = await request.json().catch(() => ({}));
       return json(await runImport(env, body));
     } catch (e) { return fail("import failed: " + e.message, 500); }
-  }
-
-  // POST /crl/fetch — pull from a specific URL (e.g. mock origin worker)
-  if (path === "/crl/fetch" && request.method === "POST") {
-    try {
-      const { url: u, format } = await request.json();
-      if (!u) return fail("url required", 400);
-      return json(await runImport(env, { url: u, format }));
-    } catch (e) { return fail("fetch failed: " + e.message, 500); }
   }
 
   // GET /crl/status — metadata + sync status
@@ -228,8 +286,10 @@ export async function handleImport(request, env) {
 
   // GET /crl/raw — current revoked serial list (debug)
   if (path === "/crl/raw") {
-    const list = await env.REVOKED_CERTS.get("crl:current", "json");
-    return json({ ok: true, revoked_serials: list || [] });
+    const kv = env.REVOKED_CERTS;
+    const list = await kv.get("crl:current", "json");
+    const meta = await kv.get("crl:current:meta", "json");
+    return json({ ok: true, revoked_serials: list || [], serial_count: meta?.serial_count || 0, crl_current_stored: !(meta && meta.crl_current_overflow) });
   }
 
   return fail("importer endpoint not found", 404);
