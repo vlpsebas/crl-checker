@@ -37,3 +37,62 @@ TELEMETRY = "true"
 # [[r2_buckets]]
 # binding = "CRL_BUCKET"
 # bucket_name = "crl-storage"
+
+
+
+
+
+
+name = "crl-checker-demo"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# KV shared by validator + importer. Create: wrangler kv namespace create REVOKED_CERTS
+[[kv_namespaces]]
+binding = "REVOKED_CERTS"
+id = "9c8286c0aa9d4267b832e46b1b4edd02"
+
+[[kv_namespaces]]
+binding = "CRL_DATA"
+id = "64b52e5fd5f24b2e9042a6c3dbe9ab27"
+
+# Durable Object: assembles chunked CRL uploads (only needed for CRLs > request body limit)
+[durable_objects]
+bindings = [{ name = "CRL_PROCESSOR", class_name = "CRLProcessor" }]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CRLProcessor"]
+
+# Twice daily: 06:00 and 18:00 UTC (morning + night refresh)
+[triggers]
+crons = ["0 6,18 * * *"]
+
+[vars]
+FILE_ORIGIN_URL = "http://localhost:8788"
+ADMIN_SECRET = "dev-secret-12345"
+# Fail-closed staleness: block requests when CRL older than this, or past nextUpdate
+CRL_MAX_AGE_HOURS = "24"
+# Set to "true" to enable per-request usage counters (pricing data) — off by default
+TELEMETRY = "true"
+
+# Admin auth: set with `wrangler secret put ADMIN_SECRET` (do NOT put secrets in vars)
+
+# Optional: R2 bucket for CRL + CA list storage (uncomment to use R2 instead of HTTP fetch).
+# R2 holds BOTH files: CRL (key "crl.pem") and CA certificate list (key "ca.pem").
+# Fetch both together with: POST /crl/import/fetch?file=crl.pem&ca_file=ca.pem
+# [[r2_buckets]]
+# binding = "CRL_BUCKET"
+# bucket_name = "crl-storage"
+
+# Production environment
+[env.production]
+vars = { FILE_ORIGIN_URL = "https://file-origin.your-domain.workers.dev", ADMIN_SECRET = "change-me-in-production" }
+
+[[env.production.kv_namespaces]]
+binding = "REVOKED_CERTS"
+id = "prod-crl-revoked-certs"
+
+[[env.production.kv_namespaces]]
+binding = "CRL_DATA"
+id = "prod-crl-data-store"
