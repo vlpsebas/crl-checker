@@ -1,96 +1,62 @@
-/**
- * CRL Revocation Demo Worker
- * 
- * Integrated routes:
- * 1. /crl/origin/* — CRL Origin (emulates origin serving CRL)
- * 2. /crl/import/* — CRL Importer (fetches from origin, updates KV)
- * 3. / and /health/* — mTLS Validator (checks requests against KV)
- * 4. /test/* — Test endpoints (verify flows without mTLS)
- */
-
 // ============================================================
-// Utility Functions
+// CRL Checker Worker - mTLS Validator + CRL Importer + Telemetry
 // ============================================================
 
-const jsonResponse = (data, status = 200) => {
-  return new Response(JSON.stringify(data, null, 2), {
+// Helper functions
+const jsonResponse = (data, status = 200) =>
+  new Response(JSON.stringify(data, null, 2), {
     status,
     headers: { "content-type": "application/json" },
   });
-};
 
-const errorResponse = (message, status = 400) => {
-  return jsonResponse({ success: false, error: message }, status);
-};
+const errorResponse = (message, status = 400) =>
+  jsonResponse({ success: false, error: message }, status);
 
+// Normalize serial number (lowercase, strip leading zeros, remove colons/spaces)
 const normalizeSerial = (serial) => {
-  return serial.toLowerCase().replace(/^0+/, "").replace(/[:\s]/g, "") || "0";
+  if (!serial) return "0";
+  return serial
+    .toLowerCase()
+    .replace(/^0+/, "")
+    .replace(/[:\s]/g, "");
 };
 
+// Normalize fingerprint (lowercase, remove colons)
 const normalizeFingerprint = (fp) => fp.replace(/:/g, "").toLowerCase();
 
 // ============================================================
-// CRL Origin Worker (Emulates origin serving CRL)
+// CRL Importer - Fetch CRL from file origin and update KV
 // ============================================================
 
-const sampleCRLPEM = `-----BEGIN X509 CRL-----
-MIIBkzCBfQIBATANBgkqhkiG9w0BAQsFADBFMQswCQYDVQQGEwJBVTETMBEGA1UE
-CAwOU291dGggV2VsZXMxJDAiBgNVBAoMG0ludGVybmV0IFdpZGdpdHMgUHR5IEx0
-ZBA4EzAVBgNVBAMTDmNybC1kZW1vLXJvb3Q0
------END X509 CRL-----`;
-
-async function handleCRLOrigin(request) {
-  const url = new URL(request.url);
-  const path = url.pathname;
-
-  // GET /crl/origin/pem — return CRL in PEM format
-  if (path === "/crl/origin/pem" || path === "/crl/origin") {
-    return new Response(sampleCRLPEM, {
-      status: 200,
-      headers: {
-        "content-type": "application/x-pem-file",
-        "cache-control": "max-age=43200",
-      },
-    });
+// Simplified PEM CRL parser (extracts serial numbers)
+function extractRevokeSerialsFromPEM(pem) {
+  // In production, use a proper DER/ASN.1 parser
+  // This is a placeholder that extracts hex-like patterns
+  const serials = [];
+  const lines = pem.split('\n');
+  
+  for (const line of lines) {
+    const match = line.match(/[0-9A-Fa-f:]{16,}/g);
+    if (match) {
+      match.forEach(serial => {
+        const normalized = normalizeSerial(serial);
+        if (normalized && normalized !== "0") {
+          serials.push(normalized);
+        }
+      });
+    }
   }
-
-  // GET /crl/origin/der — return CRL in DER format (base64)
-  if (path === "/crl/origin/der") {
-    const derBase64 = btoa(sampleCRLPEM);
-    return new Response(derBase64, {
-      status: 200,
-      headers: {
-        "content-type": "application/octet-stream",
-        "cache-control": "max-age=43200",
-      },
-    });
-  }
-
-  // GET /crl/origin/info — return metadata about the CRL
-  if (path === "/crl/origin/info") {
-    return jsonResponse({
-      success: true,
-      crl_source: "origin",
-      format: "PEM",
-      last_updated: new Date().toISOString(),
-      size: sampleCRLPEM.length,
-      description: "Sample CRL for demo purposes",
-    });
-  }
-
-  return errorResponse("CRL Origin endpoint not found", 404);
+  
+  return [...new Set(serials)]; // dedupe
 }
-
-// ============================================================
-// CRL Importer (Fetches from origin, updates KV)
-// ============================================================
 
 async function handleCRLImport(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
   const ADMIN_SECRET = env.ADMIN_SECRET || "dev-secret-12345";
-  const CRL_ORIGIN_URL = env.CRL_ORIGIN_URL || "http://localhost:8787/crl/origin";
+  const FILE_ORIGIN_URL = env.FILE_ORIGIN_URL || "http://localhost:8788";
   const REVOKED_CERTS = env.REVOKED_CERTS;
+  const CRL_DATA = env.CRL_DATA;
 
   // Authenticate admin requests
   const providedSecret = request.headers.get("X-Admin-Secret");
@@ -98,23 +64,25 @@ async function handleCRLImport(request, env) {
     return errorResponse("Unauthorized: invalid or missing X-Admin-Secret", 401);
   }
 
-  // POST /crl/import/fetch — Fetch CRL from origin (HTTP or R2) and update KV
+  // POST /crl/import/fetch - Fetch CRL from file origin (HTTP or R2) and update KV
   if (path === "/crl/import/fetch" && request.method === "POST") {
     try {
       let crlPem;
+      const crlFilename = url.searchParams.get("file") || "crl.pem";
       
-      // Check if R2 binding is available
+      // Check if R2 binding is available (direct access)
       if (env.CRL_BUCKET) {
-        console.log("Fetching CRL from R2 bucket");
-        const r2Object = await env.CRL_BUCKET.get("crl.pem");
+        console.log(`Fetching CRL from R2 bucket: ${crlFilename}`);
+        const r2Object = await env.CRL_BUCKET.get(crlFilename);
         if (!r2Object) {
-          return errorResponse("CRL not found in R2 bucket", 404);
+          return errorResponse(`CRL not found in R2 bucket: ${crlFilename}`, 404);
         }
         crlPem = await r2Object.text();
       } else {
-        // Fallback to HTTP fetch
-        console.log(`Fetching CRL from ${CRL_ORIGIN_URL}`);
-        const response = await fetch(CRL_ORIGIN_URL);
+        // Fallback to HTTP fetch from file origin
+        const fetchUrl = `${FILE_ORIGIN_URL}/file/${crlFilename}`;
+        console.log(`Fetching CRL from file origin: ${fetchUrl}`);
+        const response = await fetch(fetchUrl);
         if (!response.ok) {
           return errorResponse(
             `Failed to fetch CRL: ${response.status} ${response.statusText}`,
@@ -124,87 +92,87 @@ async function handleCRLImport(request, env) {
         crlPem = await response.text();
       }
 
-      // Parse and extract serial numbers (simplified—use real DER parser in production)
+      // Parse and extract serial numbers
       const serials = extractRevokeSerialsFromPEM(crlPem);
 
       // Update KV with revoked serials
       const metadata = {
         fetched_at: new Date().toISOString(),
-        source: CRL_ORIGIN_URL,
+        source: env.CRL_BUCKET ? "R2" : FILE_ORIGIN_URL,
         serial_count: serials.length,
-        serials: serials,
+        file: crlFilename,
       };
 
-      await REVOKED_CERTS.put("crl:metadata", JSON.stringify(metadata));
-      await REVOKED_CERTS.put("crl:last_fetch", new Date().toISOString());
+      await CRL_DATA.put("crl:metadata", JSON.stringify(metadata));
+      await CRL_DATA.put("crl:serials", JSON.stringify(serials));
+      await CRL_DATA.put("crl:last_fetch", new Date().toISOString());
 
-      // Store each serial
+      // Store each serial in REVOKED_CERTS KV
       for (const serial of serials) {
-        await REVOKED_CERTS.put(
-          `serial:${normalizeSerial(serial)}`,
-          JSON.stringify({
-            reason: "revoked",
-            revoked_at: new Date().toISOString(),
-            source: "crl_import",
-          })
-        );
+        await REVOKED_CERTS.put(`serial:${serial}`, JSON.stringify({
+          revoked: true,
+          added_at: new Date().toISOString(),
+          source: "crl_import",
+        }));
       }
 
       return jsonResponse({
         success: true,
-        message: "CRL fetched and stored",
-        metadata,
+        message: "CRL imported successfully",
+        serials_imported: serials.length,
+        metadata: metadata,
       });
+
     } catch (e) {
       return errorResponse(`Import failed: ${e.message}`, 500);
     }
   }
 
-  // GET /crl/import/status — Check import status
+  // GET /crl/import/status - Check CRL import status
   if (path === "/crl/import/status" && request.method === "GET") {
     try {
-      const metadata = await REVOKED_CERTS.get("crl:metadata", { type: "json" });
-      const lastFetch = await REVOKED_CERTS.get("crl:last_fetch");
+      const metadata = await CRL_DATA.get("crl:metadata", "json");
+      const lastFetch = await CRL_DATA.get("crl:last_fetch");
+      const serials = await CRL_DATA.get("crl:serials", "json");
 
       return jsonResponse({
         success: true,
-        metadata,
-        last_fetch: lastFetch,
+        metadata: metadata || null,
+        last_fetch: lastFetch || null,
+        serial_count: serials ? serials.length : 0,
       });
     } catch (e) {
       return errorResponse(`Status check failed: ${e.message}`, 500);
     }
   }
 
-  // POST /crl/import/manual — Manually add a revoked serial
+  // POST /crl/import/manual - Manually revoke a serial number
   if (path === "/crl/import/manual" && request.method === "POST") {
     try {
       const body = await request.json();
-      const { serial, reason } = body;
+      const serial = body.serial;
+      const reason = body.reason || "manual_revocation";
 
       if (!serial) {
-        return errorResponse("serial is required");
+        return errorResponse("Serial number required");
       }
 
-      const normalizedSerial = normalizeSerial(serial);
-      await REVOKED_CERTS.put(
-        `serial:${normalizedSerial}`,
-        JSON.stringify({
-          reason: reason || "manual revocation",
-          revoked_at: new Date().toISOString(),
-          source: "manual",
-        })
-      );
+      const normalized = normalizeSerial(serial);
+      await REVOKED_CERTS.put(`serial:${normalized}`, JSON.stringify({
+        revoked: true,
+        added_at: new Date().toISOString(),
+        source: "manual",
+        reason: reason,
+      }));
 
-      return jsonResponse(
-        {
-          success: true,
-          message: `Serial ${normalizedSerial} marked as revoked`,
-        },
-        201
-      );
+      return jsonResponse({
+        success: true,
+        message: "Serial revoked manually",
+        serial: normalized,
+      });
+
     } catch (e) {
-      return errorResponse(`Manual revocation failed: ${e.message}`);
+      return errorResponse(`Manual revocation failed: ${e.message}`, 500);
     }
   }
 
@@ -212,43 +180,47 @@ async function handleCRLImport(request, env) {
 }
 
 // ============================================================
-// mTLS Validator (Check requests against KV)
+// mTLS Validator - Check certificate against KV
 // ============================================================
 
 async function validateMTLS(request, REVOKED_CERTS) {
-  const tlsClientAuth = request.cf?.tlsClientAuth;
+  // Extract client certificate from Cloudflare mTLS headers
+  const certPem = request.headers.get("cf-client-cert-pem");
+  const certSerial = request.headers.get("cf-client-cert-serial");
+  const certFingerprint = request.headers.get("cf-client-cert-fingerprint");
+  const certIssuer = request.headers.get("cf-client-cert-issuer");
+  const certSubject = request.headers.get("cf-client-cert-subject");
 
-  if (!tlsClientAuth || tlsClientAuth.certPresented !== "1") {
-    throw new Error("mTLS: Client certificate not presented");
+  if (!certPem && !certSerial) {
+    throw new Error("No client certificate presented");
   }
 
-  if (tlsClientAuth.certVerified !== "SUCCESS") {
-    throw new Error(
-      `mTLS: Certificate not verified (${tlsClientAuth.certVerified})`
-    );
-  }
+  const certInfo = {
+    serial: certSerial,
+    fingerprint: certFingerprint,
+    issuer: certIssuer,
+    subject: certSubject,
+  };
 
-  // Check KV for revoked serial
-  const serial = tlsClientAuth.certSerial;
-  if (serial) {
-    const normalizedSerial = normalizeSerial(serial);
-    const revokedEntry = await REVOKED_CERTS.get(
-      `serial:${normalizedSerial}`
-    );
-    if (revokedEntry !== null) {
-      const details = JSON.parse(revokedEntry);
-      throw new Error(
-        `mTLS: Certificate revoked (serial: ${serial}, reason: ${details.reason})`
-      );
+  // Check revocation by serial
+  if (certSerial) {
+    const normalized = normalizeSerial(certSerial);
+    const revoked = await REVOKED_CERTS.get(`serial:${normalized}`);
+    if (revoked) {
+      throw new Error(`Certificate revoked (serial: ${normalized})`);
     }
   }
 
-  return {
-    fingerprint: tlsClientAuth.certFingerprintSHA256,
-    serial: tlsClientAuth.certSerial,
-    issuer: tlsClientAuth.certIssuerDN,
-    subject: tlsClientAuth.certSubjectDN,
-  };
+  // Check revocation by fingerprint
+  if (certFingerprint) {
+    const normalized = normalizeFingerprint(certFingerprint);
+    const revoked = await REVOKED_CERTS.get(`fingerprint:${normalized}`);
+    if (revoked) {
+      throw new Error(`Certificate revoked (fingerprint: ${normalized})`);
+    }
+  }
+
+  return certInfo;
 }
 
 async function handleMTLSValidator(request, env) {
@@ -257,68 +229,59 @@ async function handleMTLSValidator(request, env) {
   const REVOKED_CERTS = env.REVOKED_CERTS;
   const ADMIN_SECRET = env.ADMIN_SECRET || "dev-secret-12345";
 
-  // GET /health — Service health check (no mTLS required)
-  if (path === "/health" || path === "/health/status") {
-    try {
-      const metadata = await REVOKED_CERTS.get("crl:metadata", { type: "json" });
-      const lastFetch = await REVOKED_CERTS.get("crl:last_fetch");
-
-      return jsonResponse({
-        success: true,
-        status: "healthy",
-        crl_status: {
-          fetched: !!metadata,
-          last_fetch: lastFetch,
-          serial_count: metadata?.serial_count || 0,
-        },
-      });
-    } catch (e) {
-      return errorResponse(`Health check failed: ${e.message}`, 503);
-    }
-  }
-
-  // GET /debug/cert — Show the cert fields (requires mTLS)
-  if (path === "/debug/cert") {
-    const tlsClientAuth = request.cf?.tlsClientAuth;
+  // GET /health
+  if (path === "/health") {
     return jsonResponse({
       success: true,
-      cert_presented: tlsClientAuth?.certPresented === "1",
-      cert_verified: tlsClientAuth?.certVerified,
-      fields: tlsClientAuth || {},
+      service: "crl-checker",
+      timestamp: new Date().toISOString(),
+      kv_configured: !!REVOKED_CERTS,
     });
   }
 
-  // GET /debug/kv — Show current KV contents (admin only)
+  // GET /debug/cert - Show presented certificate fields
+  if (path === "/debug/cert") {
+    const certInfo = {
+      serial: request.headers.get("cf-client-cert-serial"),
+      fingerprint: request.headers.get("cf-client-cert-fingerprint"),
+      issuer: request.headers.get("cf-client-cert-issuer"),
+      subject: request.headers.get("cf-client-cert-subject"),
+      not_before: request.headers.get("cf-client-cert-not-before"),
+      not_after: request.headers.get("cf-client-cert-not-after"),
+    };
+
+    return jsonResponse({
+      success: true,
+      certificate: certInfo,
+    });
+  }
+
+  // GET /debug/kv - Show KV contents (admin only)
   if (path === "/debug/kv") {
     const providedSecret = request.headers.get("X-Admin-Secret");
     if (!providedSecret || providedSecret !== ADMIN_SECRET) {
-      return errorResponse("Unauthorized", 401);
+      return errorResponse("Unauthorized: invalid or missing X-Admin-Secret", 401);
     }
 
     try {
-      const metadata = await REVOKED_CERTS.get("crl:metadata", { type: "json" });
-      const list = await REVOKED_CERTS.list({ prefix: "serial:" });
-
-      const serials = [];
-      for (const key of list.keys) {
-        const value = await REVOKED_CERTS.get(key.name);
-        serials.push({
-          key: key.name,
-          details: JSON.parse(value),
-        });
-      }
+      const metadata = await env.CRL_DATA.get("crl:metadata", "json");
+      const serials = await env.CRL_DATA.get("crl:serials", "json");
+      const lastFetch = await env.CRL_DATA.get("crl:last_fetch");
 
       return jsonResponse({
         success: true,
-        metadata,
-        revoked_serials: serials,
+        crl_data: {
+          metadata,
+          serial_count: serials ? serials.length : 0,
+          last_fetch: lastFetch,
+        },
       });
     } catch (e) {
-      return errorResponse(`KV read failed: ${e.message}`, 500);
+      return errorResponse(`KV debug failed: ${e.message}`, 500);
     }
   }
 
-  // GET /mtls/check — Validate current mTLS cert (requires mTLS)
+  // GET /mtls/check - Validate current mTLS cert
   if (path === "/mtls/check") {
     try {
       const certInfo = await validateMTLS(request, REVOKED_CERTS);
@@ -332,7 +295,7 @@ async function handleMTLSValidator(request, env) {
     }
   }
 
-  // GET /mtls/allow — Confirm allowed certificate (requires mTLS)
+  // GET /mtls/allow - Confirm allowed certificate
   if (path === "/mtls/allow") {
     try {
       const certInfo = await validateMTLS(request, REVOKED_CERTS);
@@ -346,13 +309,13 @@ async function handleMTLSValidator(request, env) {
     }
   }
 
-  // GET / — Default endpoint (requires mTLS)
-  if (path === "/") {
+  // GET / - Default endpoint (requires valid mTLS cert)
+  if (path === "/" || path === "") {
     try {
       const certInfo = await validateMTLS(request, REVOKED_CERTS);
       return jsonResponse({
         success: true,
-        message: "mTLS validation passed",
+        message: "mTLS authentication successful",
         certificate: certInfo,
       });
     } catch (e) {
@@ -364,14 +327,14 @@ async function handleMTLSValidator(request, env) {
 }
 
 // ============================================================
-// Test Endpoints (No mTLS required)
+// Test Endpoints
 // ============================================================
 
 async function handleTest(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // GET /test/ping — Simple connectivity test
+  // GET /test/ping
   if (path === "/test/ping") {
     return jsonResponse({
       success: true,
@@ -380,38 +343,34 @@ async function handleTest(request, env) {
     });
   }
 
-  // GET /test/crl/origin — Verify CRL origin is reachable
-  if (path === "/test/crl/origin") {
+  // GET /test/file-origin - Verify file origin is reachable
+  if (path === "/test/file-origin") {
     try {
-      const originUrl =
-        env.CRL_ORIGIN_URL || "http://localhost:8787/crl/origin";
-      const response = await fetch(`${originUrl}/info`);
+      const originUrl = env.FILE_ORIGIN_URL || "http://localhost:8788";
+      const response = await fetch(`${originUrl}/health`);
       if (response.ok) {
         const data = await response.json();
         return jsonResponse({
           success: true,
-          message: "CRL origin is reachable",
-          origin_data: data,
+          message: "File origin is reachable",
+          origin_url: originUrl,
+          origin_health: data,
         });
+      } else {
+        return errorResponse(`File origin returned ${response.status}`, response.status);
       }
-      return errorResponse("CRL origin returned error", response.status);
     } catch (e) {
-      return errorResponse(`CRL origin unreachable: ${e.message}`);
+      return errorResponse(`Failed to reach file origin: ${e.message}`, 500);
     }
   }
 
-  // GET /test/endpoints — List all available endpoints
+  // GET /test/endpoints - List all endpoints
   if (path === "/test/endpoints") {
     return jsonResponse({
       success: true,
       endpoints: {
-        crl_origin: [
-          "GET  /crl/origin/pem   — Return CRL in PEM format",
-          "GET  /crl/origin/der   — Return CRL in DER format (base64)",
-          "GET  /crl/origin/info  — Return CRL metadata",
-        ],
         crl_import: [
-          "POST /crl/import/fetch  — Fetch CRL from origin and update KV (admin only)",
+          "POST /crl/import/fetch?file=<filename> — Fetch CRL from file origin (HTTP or R2) and update KV (admin only)",
           "GET  /crl/import/status — Check import status (admin only)",
           "POST /crl/import/manual — Manually revoke a serial (admin only)",
         ],
@@ -425,13 +384,10 @@ async function handleTest(request, env) {
         ],
         test: [
           "GET  /test/ping        — Simple connectivity test",
-          "GET  /test/crl/origin  — Verify CRL origin is reachable",
+          "GET  /test/file-origin — Verify file origin is reachable",
           "GET  /test/endpoints   — List all endpoints",
         ],
       },
-      admin_header: "X-Admin-Secret",
-      notes:
-        "Endpoints marked (admin only) require X-Admin-Secret header with correct value",
     });
   }
 
@@ -439,17 +395,7 @@ async function handleTest(request, env) {
 }
 
 // ============================================================
-// Helper: Extract serials from CRL PEM (simplified)
-// ============================================================
-
-function extractRevokeSerialsFromPEM(pem) {
-  // In production, use a proper ASN.1 DER parser
-  // For demo, return sample serials
-  return ["0123456789abcdef", "fedcba9876543210", "aabbccddeeff0011"];
-}
-
-// ============================================================
-// Main Request Router
+// Main Router
 // ============================================================
 
 export default {
@@ -459,9 +405,6 @@ export default {
 
     try {
       // Route to appropriate handler
-      if (path.startsWith("/crl/origin")) {
-        return await handleCRLOrigin(request);
-      }
       if (path.startsWith("/crl/import")) {
         return await handleCRLImport(request, env);
       }
