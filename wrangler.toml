@@ -28,3 +28,8 @@ CRL_MAX_AGE_HOURS = "24"
 TELEMETRY = "true"
 
 # Admin auth: set with `wrangler secret put ADMIN_SECRET` (do NOT put secrets in vars)
+
+# Optional: R2 bucket for CRL storage (uncomment to use R2 instead of HTTP fetch)
+# [[r2_buckets]]
+# binding = "CRL_BUCKET"
+# bucket_name = "crl-storage"
