@@ -1,295 +1,127 @@
-# CRL Checker Demo - Two Worker Architecture
+# crl-checker
 
-This demo implements custom Certificate Revocation List (CRL) checking for mTLS at the edge using two separate Cloudflare Workers.
+Single Worker: mTLS cert validation + custom CRL revocation at the edge for BYOCA.
+Cloudflare WAF handles the mTLS handshake; this Worker checks the client cert serial against
+a CRL published to KV, fail-closed. Shared as a generic demo — **you must set the parameters
+below before it will run.**
 
-## Architecture
+## Files
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Client with mTLS Cert                                       │
-└──────────────────┬──────────────────────────────────────────┘
-                   │
-                   ▼
-        ┌──────────────────────┐
-        │  Cloudflare WAF      │  ◄── mTLS handshake
-        │  (Initial mTLS)      │
-        └──────────┬───────────┘
-                   │
-                   ▼
-        ┌──────────────────────┐
-        │  crl-checker Worker  │  ◄── Validates cert against KV
-        │  (Validator)         │
-        └──────────┬───────────┘
-                   │
-                   ├─── ✅ Valid → Proxy to Origin
-                   └─── ❌ Revoked → Block (403)
+| File | Role |
+|------|------|
+| `index.js` | Entry + router (exports `CRLProcessor` DO class) |
+| `importer.js` | CRL import/parse/publish: cron, manual, URL fetch, chunked upload (DO) |
+| `validator.js` | mTLS + CRL check (fail-closed) |
+| `admin.js` | Shared utils + usage counters + `/admin/usage` pricing report |
+| `telemetry.js` | OPTIONAL per-request usage log (import in index.js to enable) |
+| `wrangler.toml` | Config: KV, DO, cron `0 6,18 * * *`, vars |
 
-CRL Update Flow:
-        ┌──────────────────────┐
-        │  file-origin Worker  │  ◄── Generic R2 file storage
-        │  (File Storage)      │
-        └──────────┬───────────┘
-                   │
-                   ▼ (fetch /file/crl.pem)
-        ┌──────────────────────┐
-        │  crl-checker Worker  │
-        │  (Importer)          │  ◄── Parses CRL, updates KV
-        └──────────────────────┘
-```
+---
 
-## Workers
+## Parameters to set before deploy (checklist)
 
-### 1. `crl-checker` (Port 8787)
-**Purpose:** Validate mTLS certificates, import CRL data (fetch, direct upload, chunked), emit telemetry
+Every value below is **yours to choose/replace** — the repo ships with placeholders.
 
-**Routes:**
-- `/mtls/check`, `/mtls/allow` — Validate certificate
-- `/crl/import/fetch?file=<name>` — Fetch PEM bundle (CA certs / CRL / both) from file-origin / R2 and update KV
-- `/crl/import/upload` — **Direct PEM upload** (<100MB request body limit): CA certs, CRL, or combined bundle → auto-cross-references revoked serials against certs, blocks by exact fingerprint
-- `/crl/import/chunk` + `/crl/import/finalize` — **Chunked upload** via `CRL_PROCESSOR` Durable Object (files > request limit)
-- `/crl/import/status`, `/crl/import/chunks/status` — Check import / session status
-- `/health` — Health check
-
-**Dependencies:**
-- KV: `REVOKED_CERTS` (hot path), `CRL_DATA` (metadata)
-- **DO: `CRL_PROCESSOR`** — assembles chunked uploads (emulates real customer direct-upload environments)
-- Optional R2: `CRL_BUCKET` (direct access)
-- Env: `FILE_ORIGIN_URL` (points to file-origin worker), `CRL_MAX_AGE_HOURS`, `TELEMETRY`
-- Cron: `0 6,18 * * *` (twice-daily scheduled CRL sync)
-
-### R2 Dual-Use: CRL + CA List in One Bucket
-
-The optional `CRL_BUCKET` R2 bucket stores **both** the CRL and the CA certificate list:
-
-| Object key | Contents |
-|-----------|----------|
-| `crl.pem` | Revocation list (default fetch target) |
-| `ca.pem`  | CA certificate bundle (for fingerprint cross-referencing) |
-| anything else | Any file (via generic file-origin upload) |
-
-Import them together (cross-references revoked serials → exact fingerprints):
-```bash
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/fetch?file=crl.pem&ca_file=ca.pem" \
-  -H "X-Admin-Secret: dev-secret-12345"
-```
-
-Or grab every object under a prefix in one shot:
-```bash
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/fetch?all=crl/" \
-  -H "X-Admin-Secret: dev-secret-12345"
-```
-
-Files land in R2 via the generic file-origin worker:
-```bash
-curl -X POST "https://file-origin.<subdomain>.workers.dev/upload?filename=crl.pem" \
-  -H "X-Admin-Secret: dev-secret-12345" --data-binary @crl.pem
-curl -X POST "https://file-origin.<subdomain>.workers.dev/upload?filename=ca.pem" \
-  -H "X-Admin-Secret: dev-secret-12345" --data-binary @ca.pem
-```
-
-> Both workers can share the same R2 bucket: file-origin writes (`FILES` binding), crl-checker reads (`CRL_BUCKET` binding).
-
-### 2. `file-origin` (Port 8788)
-**Purpose:** Generic file upload/download service (not CRL-specific, reusable standalone — upload a file, get an HTTP reference anywhere)
-
-**Routes:**
-- `POST /upload?filename=<name>` — Upload any file (raw binary `--data-binary` or multipart `-F file=@`)
-- `GET /file/<name>` — Download file (public HTTP reference)
-- `GET /file/<name>/info` — File metadata (admin)
-- `DELETE /file/<name>` — Delete file (admin)
-- `GET /list` — List all files (admin)
-
-**Dependencies:**
-- R2: `FILES` bucket
-
-## Quick Start
-
-### Prerequisites
-```bash
-# Install Wrangler
-npm install -g wrangler
-
-# Authenticate
-wrangler login
-```
-
-### 1. Deploy File Origin Worker
-
-```bash
-cd workers/file-origin
-
-# Create R2 bucket
-wrangler r2 bucket create file-storage
-
-# Update wrangler.toml with your bucket name (if different)
-
-# Deploy
-npm run deploy
-```
-
-### 2. Deploy CRL Checker Worker
-
-```bash
-cd workers/crl-checker
-
-# Create KV namespaces
-wrangler kv:namespace create REVOKED_CERTS
-wrangler kv:namespace create CRL_DATA
-
-# Update wrangler.toml with your KV namespace IDs
-
-# Update FILE_ORIGIN_URL in wrangler.toml to your deployed file-origin URL
-# e.g., FILE_ORIGIN_URL = "https://file-origin.<subdomain>.workers.dev"
-
-# Deploy
-npm run deploy
-```
-
-### 3. Test the Flow
-
-```bash
-# 1. Upload a CRL to file-origin
-curl -X POST "https://file-origin.<subdomain>.workers.dev/upload?filename=crl.pem" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  --data-binary @sample-crl.pem
-
-# 2a. Import via fetch (from file-origin / R2)
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/fetch?file=crl.pem" \
-  -H "X-Admin-Secret: dev-secret-12345"
-
-# 2b. OR direct upload (emulates real customer environment — file goes straight to the importer)
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/upload" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  --data-binary @sample-crl.pem
-
-# 2b-ii. OR combined CA bundle + CRL on ONE upload (cross-references revoked
-#        serials against certs, blocks by exact fingerprint)
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/upload" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  --data-binary @ca-bundle-and-crl.pem
-
-#        (JSON form also accepted: {"ca_pem":"...", "crl_pem":"..."})
-
-# 2c. OR chunked upload via Durable Object (for CRLs > request body limit)
-#   Split file into base64 chunks, e.g. 512KB each:
-#   split -b 512k sample-crl.pem; base64 each part; POST each as:
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/chunk" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  -H "content-type: application/json" \
-  -d '{"session_id":"crl-2026-01","chunk_index":0,"total_chunks":3,"data":"<base64-chunk-0>"}'
-#   ... repeat for chunks 1..N, then:
-curl -X POST "https://crl-checker.<subdomain>.workers.dev/crl/import/finalize" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  -H "content-type: application/json" \
-  -d '{"session_id":"crl-2026-01"}'
-
-# 3. Check import status
-curl "https://crl-checker.<subdomain>.workers.dev/crl/import/status" \
-  -H "X-Admin-Secret: dev-secret-12345"
-
-# 4. Test mTLS validation
-curl "https://crl-checker.<subdomain>.workers.dev/mtls/check" \
-  --cert client.pem \
-  --key client-key.pem
-```
-
-## Local Development
-
-Run both workers locally in separate terminals:
-
-```bash
-# Terminal 1: File Origin
-cd workers/file-origin
-npm run dev  # Runs on http://localhost:8788
-
-# Terminal 2: CRL Checker
-cd workers/crl-checker
-npm run dev  # Runs on http://localhost:8787
-```
-
-**Test locally:**
-```bash
-# Upload a file
-curl -X POST "http://localhost:8788/upload?filename=test-crl.pem" \
-  -H "X-Admin-Secret: dev-secret-12345" \
-  --data-binary @test-crl.pem
-
-# Import CRL
-curl -X POST "http://localhost:8787/crl/import/fetch?file=test-crl.pem" \
-  -H "X-Admin-Secret: dev-secret-12345"
-
-# Check status
-curl -s http://localhost:8787/crl/import/status \
-  -H "X-Admin-Secret: dev-secret-12345" | jq
-```
-
-## Production Configuration
-
-### file-origin (wrangler.toml)
+### 1. Worker name — `wrangler.toml`
 ```toml
-[env.production]
-[[env.production.r2_buckets]]
-binding = "FILES"
-bucket_name = "prod-file-storage"
+name = "crl-checker"   # ← replace with your own, e.g. "my-crl-demo"
 ```
+This becomes your Worker's default subdomain: `<name>.<account>.workers.dev`.
 
-### crl-checker (wrangler.toml)
+### 2. KV namespace — `wrangler.toml` `[[kv_namespaces]]`
+This Worker needs ONE KV namespace (binding name is fixed in code: `REVOKED_CERTS`).
+```bash
+wrangler kv namespace create REVOKED_CERTS
+```
+Copy the returned **namespace id** into `wrangler.toml`:
 ```toml
-[env.production]
-vars = { FILE_ORIGIN_URL = "https://file-origin.your-domain.workers.dev" }
-
-[[env.production.kv_namespaces]]
+[[kv_namespaces]]
 binding = "REVOKED_CERTS"
-id = "prod-crl-revoked-certs"
-
-[[env.production.kv_namespaces]]
-binding = "CRL_DATA"
-id = "prod-crl-data-store"
+id = "REPLACE_WITH_KV_ID"   # ← paste your id here
 ```
+You may also create it in the dashboard (Workers & Pages → KV → Create namespace).
 
-Deploy to production:
+### 3. Durable Object — `wrangler.toml` `[durable_objects]` + `[[migrations]]`
+No separate "creation" step — the DO class (`CRLProcessor`) is exported from `index.js`.
+Keep these two blocks as-is (they register the class with the Worker):
+```toml
+[durable_objects]
+bindings = [{ name = "CRL_PROCESSOR", class_name = "CRLProcessor" }]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["CRLProcessor"]
+```
+`CRL_PROCESSOR` (binding name) and `CRLProcessor` (class name) are referenced in code —
+do not rename unless you update `importer.js` / `index.js` too.
+
+### 4. CRL source URL — `wrangler.toml` `[vars]`
+```toml
+[vars]
+CRL_ORIGIN_URL = "https://your-crl-source.example.com/crl.pem"   # ← your CRL endpoint (PEM or DER)
+CRL_FORMAT = "pem"                                               # "pem" or "der"
+```
+The cron job and `POST /crl/import` fetch from this URL. For demo, it can be any
+HTTPS endpoint returning a CRL file (or a mock origin Worker you control).
+
+### 5. Staleness / fail-closed window — `wrangler.toml` `[vars]`
+```toml
+CRL_MAX_AGE_HOURS = "24"   # ← max allowed age of the imported CRL before requests are blocked
+```
+Validator blocks (503) if the loaded CRL is older than this, or past its `nextUpdate` expiry.
+
+### 6. Optional telemetry — `wrangler.toml` `[vars]`
+```toml
+TELEMETRY = "false"   # "true" → count requests + cpu_ms into KV usage counters
+```
+Pricing reference only; leave `false` if you don't need it.
+
+### 7. Admin secret — set as a SECRET, not a var
 ```bash
-npm run deploy:prod
+wrangler secret put ADMIN_SECRET
 ```
+Protects all write endpoints (`/crl/import`, `/crl/fetch`, `/crl/upload/*`, `/admin/*`).
+Requests must send header `X-Admin-Secret: <value>`. **Never** put it in `[vars]` —
+secrets in vars get baked into the deployed bundle.
 
-## Scheduled CRL Updates
-
-Add to `crl-checker/wrangler.toml`:
+### 8. Cron schedule (optional) — `wrangler.toml` `[triggers]`
 ```toml
 [triggers]
-crons = ["0 */12 * * *"]  # Every 12 hours
+crons = ["0 6,18 * * *"]   # ← default: 06:00 & 18:00 UTC (twice daily)
+```
+Adjust to match how often your source CRL's `nextUpdate` changes.
+
+### 9. Compatibility date
+```toml
+compatibility_date = "2024-11-01"   # ← bump if wrangler warns about deprecated runtime features
 ```
 
-Add cron handler to `crl-checker/src/index.js`:
-```javascript
-export default {
-  async fetch(request, env) { /* ... */ },
-  
-  async scheduled(event, env, ctx) {
-    const response = await fetch(`${env.FILE_ORIGIN_URL.replace('http://', 'https://')}/crl/import/fetch?file=crl.pem`, {
-      method: "POST",
-      headers: { "X-Admin-Secret": env.ADMIN_SECRET }
-    });
-    console.log("Scheduled CRL sync:", await response.json());
-  }
-};
+---
+
+## Quick setup (after the checklist)
+
+```bash
+npm install
+wrangler kv namespace create REVOKED_CERTS   # paste id into wrangler.toml
+wrangler secret put ADMIN_SECRET
+wrangler deploy
 ```
+Local dev (needs remote KV/DO): `npm run dev` (runs `wrangler dev --remote`).
 
-## Security Notes
+## Endpoints
 
-1. **Admin Secret:** Change `ADMIN_SECRET` in production for both workers
-2. **R2 Access:** R2 buckets are private by default
-3. **Public Endpoints:** `/file/<name>` on file-origin is public (no auth) — use for serving public files only
-4. **Private Uploads:** All admin endpoints require `X-Admin-Secret` header
+- `GET /health` — liveness + CRL freshness
+- `GET /crl/check?serial=<hex>` — revocation lookup (no mTLS)
+- `POST /crl/import` — manual import (`{url?, format?}`, admin)
+- `POST /crl/fetch` — import from URL, Worker Range-pages it & assembles in the DO (any size, admin)
+- `POST /crl/upload` — single raw CRL file body (≤100MB); Worker slices internally, NO manual chunking (`?format=pem|der|auto`, admin)
+- `GET /crl/status`, `GET /crl/raw` — metadata / revoked list (debug)
+- `GET /test/mtls?serial=<hex>` — simulated mTLS flow (demo)
+- `GET /admin/usage` — requests, KV reads/writes, KV bytes, cpu_ms (pricing reference)
+- default (any other path) — real mTLS validation, requires client cert via WAF mTLS rule
 
-## Use Cases for file-origin
+## Pricing note
 
-This worker is **generic** and can be used for:
-- CRL files (this demo)
-- Configuration files
-- Static assets
-- Backup storage
-- Any file that needs to be accessible via HTTP
-
-## License
-MIT
+Workers don't expose true CPU time/memory; `cpu_ms` ≈ wall-clock duration (billing proxy).
+Exact request volume: Cloudflare Analytics. `telemetry.js` logs one KV entry per request
+if you want per-request reference data.
