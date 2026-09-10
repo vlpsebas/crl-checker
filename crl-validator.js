@@ -1,4 +1,4 @@
-/ validator.js — mTLS + CRL revocation check, fail-closed.
+// validator.js — mTLS + CRL revocation check, fail-closed.
 // Runs on every client request (KV-only: no origin roundtrip for the check).
 // Fail-closed rules:
 //   - no CRL loaded              -> block (503)
