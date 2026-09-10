@@ -1,5 +1,5 @@
 name = "crl-checker-demo"
-main = "src/index.js"
+main = "index.js"
 compatibility_date = "2024-11-01"
 
 # KV shared by validator + importer. Create: wrangler kv namespace create REVOKED_CERTS
