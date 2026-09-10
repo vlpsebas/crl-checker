@@ -17,7 +17,7 @@ bindings = [{ name = "CRL_PROCESSOR", class_name = "CRLProcessor" }]
 
 [[migrations]]
 tag = "v1"
-new_classes = ["CRLProcessor"]
+new_sqlite_classes = ["CRLProcessor"]
 
 # Twice daily: 06:00 and 18:00 UTC (morning + night refresh)
 [triggers]
