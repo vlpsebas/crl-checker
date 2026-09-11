@@ -924,6 +924,30 @@ function storageReadableStream(storage, sid, pieceCount) {
   });
 }
 
+// Lazily concatenate a sequence of streams (bounded memory). openNext returns
+// the next ReadableStream or null when done. Used to stream multiple R2 objects
+// / HTTP responses into one body without buffering any of them.
+function concatStreams(openNext) {
+  let reader = null;
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (true) {
+          if (!reader) {
+            const stream = await openNext();
+            if (!stream) { controller.close(); return; }
+            reader = stream.getReader();
+          }
+          const { done, value } = await reader.read();
+          if (done) { reader = null; continue; }
+          controller.enqueue(value);
+          return;
+        }
+      } catch (e) { controller.error(e); }
+    },
+  });
+}
+
 export class CRLProcessor {
   constructor(state, env) {
     this.state = state;
@@ -939,7 +963,7 @@ export class CRLProcessor {
       await this.state.storage.put(key, meta);
       try {
         const stream = storageReadableStream(this.state.storage, meta.session_id, meta.pieceCount);
-        const result = await processStreamedImport(stream, this.env, "direct_upload");
+        const result = await processStreamedImport(stream, this.env, meta.source || "direct_upload");
         meta.state = "done";
         meta.summary = result.summary;
         meta.finished_at = new Date().toISOString();
@@ -959,10 +983,12 @@ export class CRLProcessor {
     const url = new URL(request.url);
     const sid = url.searchParams.get("session");
     if (!sid) return jsonResponse({ success: false, error: "session required" }, 400);
+    const source = url.searchParams.get("source") || "direct_upload";
     const { pieceCount, bytes } = await stageBodyToStorage(request.body, this.state.storage, sid);
     const meta = {
       session_id: sid,
       state: "staged",
+      source,
       pieceCount,
       bytes,
       created_at: new Date().toISOString(),
@@ -1154,69 +1180,52 @@ async function handleCRLImport(request, env) {
       const caFilename = url.searchParams.get("ca_file");
       const allPrefix = url.searchParams.get("all");
 
-      // Shared fetch helper: R2-first, falls back to file-origin HTTP
-      const fetchObject = async (key) => {
-        if (env.CRL_BUCKET) {
-          const r2Object = await env.CRL_BUCKET.get(key);
-          if (!r2Object) {
-            throw new Error(`File not found in R2 bucket: ${key}`);
-          }
-          return { data: await r2Object.text(), source: "R2", sourceUrl: `r2://${key}` };
-        }
-        const fetchUrl = `${FILE_ORIGIN_URL}/file/${key}`;
-        const response = await fetch(fetchUrl);
-        if (!response.ok) {
-          throw new Error(
-            `Failed to fetch from file-origin: ${response.status} ${response.statusText}`
-          );
-        }
-        return { data: await response.text(), source: FILE_ORIGIN_URL, sourceUrl: fetchUrl };
-      };
-
-      let pemParts = [];
-      let sourceLabel;
-      let sourceUrls = [];
-
+      // Resolve the ordered source list (R2 keys; file-origin uses the same keys).
+      let sourceKeys = [];
       try {
         if (allPrefix) {
-          // Fetch every object under a prefix (e.g. all CRL + CA files in one shot)
-          if (env.CRL_BUCKET) {
-            const listed = await env.CRL_BUCKET.list({ prefix: allPrefix });
-            for (const obj of listed.objects) {
-              const { data, sourceUrl } = await fetchObject(obj.key);
-              pemParts.push(data);
-              sourceUrls.push(sourceUrl);
-            }
-            sourceLabel = "R2";
-          } else {
+          if (!env.CRL_BUCKET) {
             return errorResponse("all= prefix fetch requires the R2 binding (CRL_BUCKET)");
           }
+          const listed = await env.CRL_BUCKET.list({ prefix: allPrefix });
+          sourceKeys = listed.objects.map((o) => o.key);
         } else {
-          // CRL (required) + CA list (optional)
-          const crl = await fetchObject(filename);
-          pemParts.push(crl.data);
-          sourceUrls.push(crl.sourceUrl);
-          sourceLabel = crl.source;
-
-          if (caFilename) {
-            const ca = await fetchObject(caFilename);
-            pemParts.push(ca.data);
-            sourceUrls.push(ca.sourceUrl);
-          }
+          sourceKeys.push(filename);
+          if (caFilename) sourceKeys.push(caFilename);
         }
       } catch (e) {
         return errorResponse(e.message, 404);
       }
 
-      const pemData = pemParts.join("\n");
-      const result = await importPEMData(
-        pemData,
-        env,
-        sourceLabel,
-        sourceUrls.join(", ")
-      );
+      // Lazily concatenate the source objects into one stream (bounded memory).
+      const queue = [...sourceKeys];
+      const combined = concatStreams(async () => {
+        if (!queue.length) return null;
+        const key = queue.shift();
+        if (env.CRL_BUCKET) {
+          const obj = await env.CRL_BUCKET.get(key);
+          if (!obj) throw new Error(`File not found in R2 bucket: ${key}`);
+          return obj.body;
+        }
+        const fetchUrl = `${FILE_ORIGIN_URL}/file/${key}`;
+        const res = await fetch(fetchUrl);
+        if (!res.ok) throw new Error(`Failed to fetch from file-origin: ${res.status} ${res.statusText}`);
+        return res.body;
+      });
 
-      return jsonResponse({ success: true, message: "Data imported successfully", ...result });
+      // Stream into the Durable Object; parse in a background alarm (no 30s cap).
+      const sid = crypto.randomUUID();
+      const stub = env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid));
+      const sourceLabel = sourceKeys.map((k) => `r2://${k}`).join(", ");
+      return await stub.fetch(
+        `https://do/?action=stage&session=${encodeURIComponent(sid)}&source=${encodeURIComponent(sourceLabel)}`,
+        {
+          method: "POST",
+          body: combined,
+          duplex: "half",
+          headers: { "content-type": "application/octet-stream" },
+        }
+      );
     }
 
     // POST /crl/import/upload — direct PEM upload (CA certs, CRL, or both; <100MB request body limit)
@@ -1258,6 +1267,7 @@ async function handleCRLImport(request, env) {
       return await stub.fetch(`https://do/?action=stage&session=${encodeURIComponent(sid)}`, {
         method: "POST",
         body: request.body,
+        duplex: "half",
         headers: { "content-type": "application/octet-stream" },
       });
     }
