@@ -78,7 +78,15 @@ function splitPEMBlocks(pem, type) {
 }
 
 function base64ToArrayBuffer(b64) {
-  const binary = atob(b64);
+  // Tolerate real-world PEM quirks: URL-safe base64 (- _), backslash
+  // line-continuation chars (RTF/TextEdit export), CRLF, stray non-base64
+  // characters, and whitespace inside the body.
+  const cleaned = (b64 || '')
+    .replace(/\\/g, '')          // strip backslash continuations
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/[^A-Za-z0-9+/=]/g, '');
+  const binary = atob(cleaned);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
