@@ -473,6 +473,176 @@ async function processCRLData(crlPem, env, source, sourceUrl = null) {
 // Single payload with both -> cross-references revoked serials against cert
 // serials and blocks by exact fingerprint.
 
+
+// --- Streaming PEM block splitter ---
+// Reads a ReadableStream and invokes handler(type, base64Body) for each complete
+// PEM block as it arrives. Only a partial trailing block is retained in memory,
+// so total payload size is unbounded (each block is processed and discarded).
+
+async function forEachPEMBlock(stream, handler) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let pending = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pending += decoder.decode(value, { stream: true });
+
+    while (true) {
+      const beginMatch = pending.match(/-----BEGIN ([A-Z0-9 ]+)-----/);
+      if (!beginMatch) {
+        pending = pending.slice(-64); // keep tail in case a marker straddles chunks
+        break;
+      }
+      const beginIdx = pending.indexOf(beginMatch[0]);
+      const type = beginMatch[1];
+      const endMarker = `-----END ${type}-----`;
+      const endIdx = pending.indexOf(endMarker, beginIdx + beginMatch[0].length);
+      if (endIdx === -1) {
+        pending = pending.slice(beginIdx); // incomplete block — keep from BEGIN
+        break;
+      }
+      const body = pending.slice(beginIdx + beginMatch[0].length, endIdx);
+      await handler(type, body);
+      pending = pending.slice(endIdx + endMarker.length);
+    }
+  }
+  decoder.decode(); // flush trailing bytes
+}
+
+// --- Streaming import (bounded memory) ---
+// Processes a streamed PEM bundle: collects certificates, writes revoked
+// serials to KV as CRL blocks arrive, then cross-references fingerprints
+// order-independently. Skips oversized metadata values to respect KV limits.
+
+async function processStreamedImport(stream, env, source) {
+  const startTime = Date.now();
+  const REVOKED_CERTS = env.REVOKED_CERTS;
+  const CRL_DATA = env.CRL_DATA;
+  const CROSS_REF_MAX = 100000; // cap on in-memory serial list for cross-ref
+
+  const certs = [];
+  const certsBySerial = new Map();
+  const crlInfoList = [];
+  const allRevokedSerials = [];
+  const revokedCertificates = [];
+  let totalSerialsFound = 0;
+  let totalSerialsWritten = 0;
+  let fingerprintMatches = 0;
+  let previousSerialsCleared = 0;
+  let previousFingerprintsCleared = 0;
+  let crossRefComplete = true;
+
+  // Clear strategy: wipe previous CRL-derived entries once, before streaming
+  const existingSerials = await REVOKED_CERTS.list({ prefix: "serial:" });
+  for (const key of existingSerials.keys) {
+    await REVOKED_CERTS.delete(key.name);
+    previousSerialsCleared++;
+  }
+  const existingFp = await REVOKED_CERTS.list({ prefix: "fingerprint:" });
+  for (const key of existingFp.keys) {
+    const val = await REVOKED_CERTS.get(key.name, "json");
+    if (!val || val.source !== "manual") {
+      await REVOKED_CERTS.delete(key.name);
+      previousFingerprintsCleared++;
+    }
+  }
+
+  await forEachPEMBlock(stream, async (type, body) => {
+    if (type === "CERTIFICATE") {
+      const certDer = base64ToArrayBuffer(body);
+      const cert = {
+        fingerprint: await computeCertFingerprint(certDer),
+        serial: extractCertSerial(certDer),
+        subjectDN: extractCertSubjectDN(certDer),
+        issuerDN: extractCertIssuerDN(certDer),
+      };
+      certs.push(cert);
+      if (cert.serial) certsBySerial.set(normalizeSerial(cert.serial), cert);
+    } else if (type === "X509 CRL") {
+      const crlDer = base64ToArrayBuffer(body);
+      const issuerDN = extractCRLIssuerDN(crlDer);
+      const { thisUpdate, nextUpdate } = extractCRLDates(crlDer);
+      const serials = extractCRLRevokedSerials(crlDer);
+      totalSerialsFound += serials.length;
+      for (const s of serials) {
+        const normalized = normalizeSerial(s.serial);
+        if (allRevokedSerials.length < CROSS_REF_MAX) {
+          allRevokedSerials.push(normalized);
+        } else {
+          crossRefComplete = false;
+        }
+        await REVOKED_CERTS.put(`serial:${normalized}`, JSON.stringify({
+          reason: "CRL import",
+          revokedAt: s.revocationDate || new Date().toISOString(),
+          issuerDN,
+          source,
+          importedAt: new Date().toISOString(),
+        }));
+        totalSerialsWritten++;
+      }
+      crlInfoList.push({ issuerDN, thisUpdate, nextUpdate, serialsFound: serials.length });
+    }
+  });
+
+  // Order-independent cross-reference: revoked serial -> cert fingerprint
+  const revokedSet = new Set(allRevokedSerials);
+  for (const cert of certs) {
+    const normalizedSerial = normalizeSerial(cert.serial);
+    if (revokedSet.has(normalizedSerial)) {
+      await REVOKED_CERTS.put(`fingerprint:${cert.fingerprint}`, JSON.stringify({
+        reason: "CRL import (serial cross-reference)",
+        revokedAt: new Date().toISOString(),
+        serial: normalizedSerial,
+        subjectDN: cert.subjectDN,
+        issuerDN: cert.issuerDN,
+        source,
+        importedAt: new Date().toISOString(),
+      }));
+      fingerprintMatches++;
+      revokedCertificates.push({
+        fingerprint: cert.fingerprint,
+        serial: normalizedSerial,
+        subjectDN: cert.subjectDN,
+        issuerDN: cert.issuerDN,
+      });
+    }
+  }
+
+  // Metadata (skip oversized lists to respect KV 25MB value limit)
+  const serialsJson = JSON.stringify(allRevokedSerials);
+  if (serialsJson.length <= 20 * 1024 * 1024) {
+    await CRL_DATA.put("crl:serials", serialsJson);
+  }
+  await CRL_DATA.put("crl:metadata", JSON.stringify({
+    lastSync: new Date().toISOString(),
+    source,
+    certs_parsed: certs.length,
+    revoked_serials: allRevokedSerials.length,
+    serials_written: totalSerialsWritten,
+    fingerprint_matches: fingerprintMatches,
+    cross_reference_complete: crossRefComplete,
+    crlInfo: crlInfoList,
+  }));
+  await CRL_DATA.put("crl:last_fetch", new Date().toISOString());
+
+  return {
+    summary: {
+      certs_parsed: certs.length,
+      revoked_serials_found: totalSerialsFound,
+      serials_written: totalSerialsWritten,
+      fingerprint_matches: fingerprintMatches,
+      previous_serials_cleared: previousSerialsCleared,
+      previous_fingerprints_cleared: previousFingerprintsCleared,
+    },
+    revoked_certificates: revokedCertificates,
+    crl_info: crlInfoList,
+    processing_time_ms: Date.now() - startTime,
+  };
+}
+
+
 async function importPEMData(pemData, env, source, sourceUrl = null) {
   const certBlocks = splitPEMBlocks(pemData, "CERTIFICATE");
   const crlBlocks = splitPEMBlocks(pemData, "X509 CRL");
@@ -878,11 +1048,14 @@ async function handleCRLImport(request, env) {
           return errorResponse("crl_pem, ca_pem, or pem required in JSON body");
         }
       } else {
-        // Raw PEM body (curl --data-binary @bundle.pem) — may contain both certs and CRL
-        pemData = await request.text();
+        // Raw PEM body (curl --data-binary @bundle.pem) — may contain both certs and CRL.
+        // Streamed: parsed block-by-block so large bundles don't exhaust memory.
+        const result = await processStreamedImport(request.body, env, "direct_upload");
+        const message = result.summary.fingerprint_matches > 0
+          ? `Uploaded and imported: ${result.summary.fingerprint_matches} revoked cert(s) matched by fingerprint`
+          : "Uploaded and imported";
+        return jsonResponse({ success: true, message, ...result });
       }
-
-      const result = await importPEMData(pemData, env, "direct_upload");
 
       const message = result.summary.fingerprint_matches > 0
         ? `Uploaded and imported: ${result.summary.fingerprint_matches} revoked cert(s) matched by fingerprint`
