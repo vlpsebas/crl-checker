@@ -25,7 +25,6 @@ crons = ["0 6,18 * * *"]
 
 [vars]
 FILE_ORIGIN_URL = "http://localhost:8788"
-ADMIN_SECRET = "dev-secret-12345"
 # Fail-closed staleness: block requests when CRL older than this, or past nextUpdate
 CRL_MAX_AGE_HOURS = "24"
 # Set to "true" to enable per-request usage counters (pricing data) — off by default
@@ -42,7 +41,7 @@ TELEMETRY = "true"
 
 # Production environment
 [env.production]
-vars = { FILE_ORIGIN_URL = "https://file-origin.your-domain.workers.dev", ADMIN_SECRET = "change-me-in-production" }
+vars = { FILE_ORIGIN_URL = "https://file-origin.your-domain.workers.dev" }
 
 [[env.production.kv_namespaces]]
 binding = "REVOKED_CERTS"
