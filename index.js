@@ -870,14 +870,119 @@ async function processCombinedData(caPem, crlPem, env, source, sourceUrl = null)
 // ============================================================
 // DURABLE OBJECT: CRLProcessor
 // ============================================================
-// Assembles chunked CRL uploads for files larger than the request
-// body limit. Chunks stored in DO storage, assembled on finalize.
+// Two jobs:
+//   1. Async import (stage -> alarm -> parse -> KV): the request handler
+//      stages the raw body into DO storage and returns immediately; alarm()
+//      reassembles and runs the (CPU-heavy) parse in the background, where it
+//      gets a ~30s CPU budget and no request wall-clock cap.
+//   2. Chunked upload (legacy): assemble client-chunked uploads.
 // ============================================================
+
+const STAGED_PIECE = 64 * 1024; // 64 KiB — safely under the 128 KiB DO value cap
+
+// Stream a request body into DO storage as fixed-size pieces. Returns counts.
+async function stageBodyToStorage(stream, storage, sid) {
+  const reader = stream.getReader();
+  let pieceIndex = 0;
+  let bytes = 0;
+  let pending = new Uint8Array(0);
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+    const combined = new Uint8Array(pending.length + chunk.length);
+    combined.set(pending);
+    combined.set(chunk, pending.length);
+    pending = combined;
+    while (pending.length >= STAGED_PIECE) {
+      const piece = pending.slice(0, STAGED_PIECE);
+      await storage.put(`staged:${sid}:${pieceIndex}`, piece);
+      bytes += STAGED_PIECE;
+      pieceIndex++;
+      pending = pending.slice(STAGED_PIECE);
+    }
+  }
+  if (pending.length) {
+    await storage.put(`staged:${sid}:${pieceIndex}`, pending);
+    bytes += pending.length;
+    pieceIndex++;
+  }
+  return { pieceCount: pieceIndex, bytes };
+}
+
+// Reassemble staged pieces into a ReadableStream (lazy pulls, bounded memory).
+function storageReadableStream(storage, sid, pieceCount) {
+  let i = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (i >= pieceCount) { controller.close(); return; }
+      const piece = await storage.get(`staged:${sid}:${i}`);
+      if (piece == null) { controller.error(new Error(`missing staged piece ${i}`)); return; }
+      controller.enqueue(piece instanceof Uint8Array ? piece : new Uint8Array(piece));
+      i++;
+    },
+  });
+}
 
 export class CRLProcessor {
   constructor(state, env) {
     this.state = state;
     this.env = env;
+  }
+
+  // Background import: reassemble staged pieces and parse them out-of-band.
+  async alarm() {
+    const sessions = await this.state.storage.list({ prefix: "staged:meta:" });
+    for (const [key, meta] of sessions) {
+      if (!meta || meta.state !== "staged") continue;
+      meta.state = "processing";
+      await this.state.storage.put(key, meta);
+      try {
+        const stream = storageReadableStream(this.state.storage, meta.session_id, meta.pieceCount);
+        const result = await processStreamedImport(stream, this.env, "direct_upload");
+        meta.state = "done";
+        meta.summary = result.summary;
+        meta.finished_at = new Date().toISOString();
+      } catch (e) {
+        meta.state = "error";
+        meta.error = e.message;
+        meta.finished_at = new Date().toISOString();
+      }
+      await this.state.storage.put(key, meta);
+      for (let i = 0; i < meta.pieceCount; i++) {
+        await this.state.storage.delete(`staged:${meta.session_id}:${i}`);
+      }
+    }
+  }
+
+  async handleStage(request) {
+    const url = new URL(request.url);
+    const sid = url.searchParams.get("session");
+    if (!sid) return jsonResponse({ success: false, error: "session required" }, 400);
+    const { pieceCount, bytes } = await stageBodyToStorage(request.body, this.state.storage, sid);
+    const meta = {
+      session_id: sid,
+      state: "staged",
+      pieceCount,
+      bytes,
+      created_at: new Date().toISOString(),
+    };
+    await this.state.storage.put(`staged:meta:${sid}`, meta);
+    await this.state.storage.setAlarm(Date.now() + 1000);
+    return jsonResponse({
+      success: true,
+      staged: true,
+      session_id: sid,
+      bytes,
+      poll: `/crl/import/status?session=${sid}`,
+    });
+  }
+
+  async handleImportStatus(request) {
+    const url = new URL(request.url);
+    const sid = url.searchParams.get("session");
+    const meta = await this.state.storage.get(`staged:meta:${sid}`);
+    return jsonResponse({ success: true, session: meta || { state: "unknown" } });
   }
 
   async fetch(request) {
@@ -894,6 +999,10 @@ export class CRLProcessor {
           return await this.handleStatus();
         case "clear":
           return await this.handleClear();
+        case "stage":
+          return await this.handleStage(request);
+        case "import_status":
+          return await this.handleImportStatus(request);
         default:
           return errorResponse("Unknown action");
       }
@@ -1136,16 +1245,21 @@ async function handleCRLImport(request, env) {
         return jsonResponse({ success: true, message, ...result });
       }
 
-      // Raw PEM body (curl --data-binary @bundle.pem) — streamed block-by-block.
-      // ?stream=1 emits NDJSON progress lines as each block is registered.
+      // Raw PEM body (curl --data-binary @bundle.pem).
+      //   ?stream=1  — synchronous: parse now, emit NDJSON progress per block.
+      //   default    — async: stage into the Durable Object, return immediately,
+      //                parse in a background alarm (longer CPU budget, no
+      //                request wall-clock cap). Poll /crl/import/status?session=<id>.
       if (streamMode) {
         return await streamUploadProgress(request.body, env, "direct_upload");
       }
-      const result = await processStreamedImport(request.body, env, "direct_upload");
-      const message = result.summary.fingerprint_matches > 0
-        ? `Uploaded and imported: ${result.summary.fingerprint_matches} revoked cert(s) matched by fingerprint`
-        : "Uploaded and imported";
-      return jsonResponse({ success: true, message, ...result });
+      const sid = crypto.randomUUID();
+      const stub = env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sid));
+      return await stub.fetch(`https://do/?action=stage&session=${encodeURIComponent(sid)}`, {
+        method: "POST",
+        body: request.body,
+        headers: { "content-type": "application/octet-stream" },
+      });
     }
 
     // POST /crl/import/chunk — chunked upload via Durable Object (large files)
@@ -1195,9 +1309,15 @@ async function handleCRLImport(request, env) {
       return await stub.fetch(`${url.origin}/crl/import/chunks/status?action=status`);
     }
 
-    // GET /crl/import/status — import metadata + sync status
+    // GET /crl/import/status — import metadata + sync status (+ ?session=<id> for async import)
     if (path === "/crl/import/status" && request.method === "GET") {
       authenticate();
+
+      const sessionId = url.searchParams.get("session");
+      if (sessionId) {
+        const stub = env.CRL_PROCESSOR.get(env.CRL_PROCESSOR.idFromName(sessionId));
+        return await stub.fetch(`https://do/?action=import_status&session=${encodeURIComponent(sessionId)}`);
+      }
 
       const metadata = await env.CRL_DATA.get("crl:metadata", "json");
       const lastFetch = await env.CRL_DATA.get("crl:last_fetch");
