@@ -529,7 +529,7 @@ async function forEachPEMBlock(stream, handler) {
 // serials to KV as CRL blocks arrive, then cross-references fingerprints
 // order-independently. Skips oversized metadata values to respect KV limits.
 
-async function processStreamedImport(stream, env, source) {
+async function processStreamedImport(stream, env, source, onProgress) {
   const startTime = Date.now();
   const REVOKED_CERTS = env.REVOKED_CERTS;
   const CRL_DATA = env.CRL_DATA;
@@ -548,6 +548,7 @@ async function processStreamedImport(stream, env, source) {
   let previousSerialsCleared = 0;
   let previousFingerprintsCleared = 0;
   let crossRefComplete = true;
+  let blockIndex = 0;
 
   // Clear strategy: wipe previous CRL-derived entries once, before streaming
   for (const prefix of ["serial:", "serialset:"]) {
@@ -597,12 +598,26 @@ async function processStreamedImport(stream, env, source) {
       }
       crlInfoList.push({ issuerDN, thisUpdate, nextUpdate, serialsFound: serials.length });
     }
+    blockIndex++;
+    if (onProgress) {
+      await onProgress({
+        type: "block",
+        block: blockIndex,
+        block_type: type,
+        certs: certs.length,
+        crls: crlInfoList.length,
+        serials_found: totalSerialsFound,
+      });
+    }
   });
 
   // Write the revocation set as shards: few parallel KV writes, no per-serial latency
   await Promise.all([...shardSets].map(([idx, set]) =>
     REVOKED_CERTS.put(`serialset:${idx}`, [...set].join("\n"))
   ));
+  if (onProgress) {
+    await onProgress({ type: "phase", phase: "shards_written", shards: shardSets.size });
+  }
 
   // Order-independent cross-reference: revoked serial -> cert fingerprint
   const revokedSet = new Set(allRevokedSerials);
@@ -626,6 +641,10 @@ async function processStreamedImport(stream, env, source) {
         issuerDN: cert.issuerDN,
       });
     }
+  }
+
+  if (onProgress) {
+    await onProgress({ type: "phase", phase: "cross_reference", matches: fingerprintMatches });
   }
 
   // Metadata (skip oversized lists to respect KV 25MB value limit)
@@ -660,6 +679,43 @@ async function processStreamedImport(stream, env, source) {
   };
 }
 
+
+
+// --- Streaming upload with NDJSON progress ---
+// Returns a Response whose body emits one JSON line per PEM block as it is
+// parsed and registered, plus phase markers, so clients can render live progress.
+async function streamUploadProgress(stream, env, source) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+  const send = async (obj) => {
+    await writer.write(encoder.encode(JSON.stringify(obj) + "\n"));
+  };
+
+  (async () => {
+    try {
+      await send({ type: "start", source, ts: new Date().toISOString() });
+      const result = await processStreamedImport(stream, env, source, send);
+      await send({
+        type: "done",
+        ...result.summary,
+        processing_time_ms: result.processing_time_ms,
+      });
+    } catch (e) {
+      await send({ type: "error", error: e.message });
+    } finally {
+      try { await writer.close(); } catch (_) {}
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "content-type": "application/x-ndjson; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
 
 async function importPEMData(pemData, env, source, sourceUrl = null) {
   const certBlocks = splitPEMBlocks(pemData, "CERTIFICATE");
@@ -1051,30 +1107,31 @@ async function handleCRLImport(request, env) {
     if (path === "/crl/import/upload" && request.method === "POST") {
       authenticate();
 
-      let pemData;
       const contentType = request.headers.get("content-type") || "";
+      const streamMode = url.searchParams.get("stream") === "1";
 
       if (contentType.includes("application/json")) {
+        // JSON body: small enough to buffer (ca_pem + crl_pem, or a single pem)
         const body = await request.json();
-        // Accept: ca_pem + crl_pem (two fields), or a single combined pem
-        if (body.ca_pem && body.crl_pem) {
-          pemData = body.ca_pem + "\n" + body.crl_pem;
-        } else {
-          pemData = body.crl_pem || body.ca_pem || body.pem;
-        }
+        const pemData = body.ca_pem && body.crl_pem
+          ? body.ca_pem + "\n" + body.crl_pem
+          : body.crl_pem || body.ca_pem || body.pem;
         if (!pemData) {
           return errorResponse("crl_pem, ca_pem, or pem required in JSON body");
         }
-      } else {
-        // Raw PEM body (curl --data-binary @bundle.pem) — may contain both certs and CRL.
-        // Streamed: parsed block-by-block so large bundles don't exhaust memory.
-        const result = await processStreamedImport(request.body, env, "direct_upload");
+        const result = await importPEMData(pemData, env, "direct_upload");
         const message = result.summary.fingerprint_matches > 0
           ? `Uploaded and imported: ${result.summary.fingerprint_matches} revoked cert(s) matched by fingerprint`
           : "Uploaded and imported";
         return jsonResponse({ success: true, message, ...result });
       }
 
+      // Raw PEM body (curl --data-binary @bundle.pem) — streamed block-by-block.
+      // ?stream=1 emits NDJSON progress lines as each block is registered.
+      if (streamMode) {
+        return await streamUploadProgress(request.body, env, "direct_upload");
+      }
+      const result = await processStreamedImport(request.body, env, "direct_upload");
       const message = result.summary.fingerprint_matches > 0
         ? `Uploaded and imported: ${result.summary.fingerprint_matches} revoked cert(s) matched by fingerprint`
         : "Uploaded and imported";
