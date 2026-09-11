@@ -1592,22 +1592,160 @@ async function handleTest(request, env) {
 // Main router
 // ============================================================
 
+
+// ============================================================
+// ADMIN + TELEMETRY (pricing/reference data)
+// ============================================================
+// Per-request telemetry: one KV entry per request under telemetry:<ts>-<rand>.
+// Opt-in via TELEMETRY="true" (wrangler.toml [vars]). Aggregate counters live in
+// usage:counters. Workers does NOT expose true CPU time or memory (RSS); wall-clock
+// duration is the closest billing proxy, and KV storage is estimated from key+value
+// lengths. Exact request volume / CPU: Cloudflare Analytics.
+
+const TELEMETRY_EMPTY = { requests: 0, cpu_ms: 0, last_request_at: null };
+
+async function recordTelemetry(request, res, env, startTime) {
+  const kv = env.CRL_DATA;
+  const ms = Date.now() - startTime;
+  try {
+    const counters = (await kv.get("usage:counters", "json")) || { ...TELEMETRY_EMPTY };
+    counters.requests = (counters.requests || 0) + 1;
+    counters.cpu_ms = (counters.cpu_ms || 0) + ms;
+    counters.last_request_at = new Date().toISOString();
+    await kv.put("usage:counters", JSON.stringify(counters));
+
+    const entry = {
+      ts: new Date().toISOString(),
+      method: request.method,
+      path: new URL(request.url).pathname,
+      status: res.status,
+      cpu_ms: ms,
+      total_requests: counters.requests,
+      note: "cpu_ms = wall-clock duration (billing proxy); Workers does not expose true CPU time or memory (RSS)",
+    };
+    const rand = Math.random().toString(36).slice(2, 8);
+    await kv.put(`telemetry:${Date.now()}-${rand}`, JSON.stringify(entry));
+  } catch (e) {
+    // telemetry must never affect the response
+    console.error("telemetry error:", e.message);
+  }
+}
+
+// Approximate KV storage: sum key+value lengths across the namespaces this worker writes.
+async function kvStorageStats(kv) {
+  let bytes = 0;
+  let keys = 0;
+  const prefixes = ["serialset:", "telemetry:", "crl:", "serial:", "fingerprint:", "usage:"];
+  for (const prefix of prefixes) {
+    let cursor;
+    do {
+      const opts = { prefix };
+      if (cursor) opts.cursor = cursor;
+      const listed = await kv.list(opts);
+      for (const k of listed.keys) {
+        bytes += k.name.length;
+        const v = await kv.get(k.name);
+        bytes += v ? v.length : 0;
+        keys++;
+      }
+      cursor = listed.list_complete ? null : listed.cursor;
+    } while (cursor);
+  }
+  return { bytes, keys };
+}
+
+async function handleAdmin(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const kv = env.CRL_DATA;
+  const ADMIN_SECRET = env.ADMIN_SECRET || "dev-secret-12345";
+
+  const providedSecret = request.headers.get("X-Admin-Secret");
+  if (!providedSecret || providedSecret !== ADMIN_SECRET) {
+    return errorResponse("Unauthorized: invalid or missing X-Admin-Secret", 401);
+  }
+
+  // GET /admin/usage — aggregate counters + recent per-request entries
+  if (path === "/admin/usage") {
+    const counters = (await kv.get("usage:counters", "json")) || { ...TELEMETRY_EMPTY };
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "50", 10) || 50, 500);
+
+    let recentKeys = [];
+    let cursor;
+    do {
+      const opts = { prefix: "telemetry:" };
+      if (cursor) opts.cursor = cursor;
+      const listed = await kv.list(opts);
+      recentKeys.push(...listed.keys.map((k) => k.name));
+      cursor = listed.list_complete ? null : listed.cursor;
+    } while (cursor && recentKeys.length < limit + 10);
+
+    // newest first (timestamp prefix sorts lexicographically)
+    recentKeys.sort((a, b) => b.localeCompare(a));
+    const recent = [];
+    for (const name of recentKeys.slice(0, limit)) {
+      const e = await kv.get(name, "json");
+      if (e) recent.push(e);
+    }
+
+    const storage = await kvStorageStats(kv);
+    return jsonResponse({
+      success: true,
+      counters,
+      kv_storage: storage,
+      recent_requests: recent,
+      pricing_notes: [
+        "cpu_ms = wall-clock duration (billing proxy; Workers does not expose true CPU time)",
+        "Workers does not expose memory (RSS) at runtime",
+        "kv_storage.bytes = estimated key+value lengths across this worker's KV namespaces",
+        "counters are eventually consistent (KV read-modify-write); exact volume -> Cloudflare Analytics",
+      ],
+    });
+  }
+
+  // GET /admin/telemetry/reset — clear counters + per-request entries
+  if (path === "/admin/telemetry/reset") {
+    await kv.put("usage:counters", JSON.stringify({ ...TELEMETRY_EMPTY }));
+    let cursor;
+    do {
+      const opts = { prefix: "telemetry:" };
+      if (cursor) opts.cursor = cursor;
+      const listed = await kv.list(opts);
+      await Promise.all(listed.keys.map((k) => kv.delete(k.name)));
+      cursor = listed.list_complete ? null : listed.cursor;
+    } while (cursor);
+    return jsonResponse({ success: true, message: "usage counters and per-request telemetry cleared" });
+  }
+
+  return errorResponse("admin endpoint not found", 404);
+}
+
 export default {
   async fetch(request, env) {
+    const startTime = Date.now();
     const url = new URL(request.url);
     const path = url.pathname;
 
+    let res;
     try {
-      if (path.startsWith("/crl/import")) {
-        return await handleCRLImport(request, env);
+      if (path.startsWith("/admin")) {
+        res = await handleAdmin(request, env);
+      } else if (path.startsWith("/crl/import")) {
+        res = await handleCRLImport(request, env);
+      } else if (path.startsWith("/test")) {
+        res = await handleTest(request, env);
+      } else {
+        res = await handleMTLSValidator(request, env);
       }
-      if (path.startsWith("/test")) {
-        return await handleTest(request, env);
-      }
-      return await handleMTLSValidator(request, env);
     } catch (e) {
-      return errorResponse(`Unhandled error: ${e.message}`, 500);
+      res = errorResponse(`Unhandled error: ${e.message}`, 500);
     }
+
+    // Per-request telemetry (opt-in via TELEMETRY="true"). Best-effort.
+    if (env.TELEMETRY === "true") {
+      await recordTelemetry(request, res, env, startTime);
+    }
+    return res;
   },
 
   async scheduled(event, env, ctx) {
