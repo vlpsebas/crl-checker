@@ -116,8 +116,12 @@ function bufferToHex(buffer) {
 
 // --- ASN.1 DER parsing ---
 
+function toView(buffer) {
+  return buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+}
+
 function parseASN1(buffer, offset = 0) {
-  const view = new Uint8Array(buffer);
+  const view = toView(buffer);
   const tag = view[offset];
   let lengthByte = view[offset + 1];
   let length;
@@ -135,24 +139,30 @@ function parseASN1(buffer, offset = 0) {
     headerLength = 2 + numLengthBytes;
   }
 
+  const contentStart = offset + headerLength;
   return {
     tag,
     headerLength,
     length,
     totalLength: headerLength + length,
-    contentOffset: offset + headerLength,
-    content: buffer.slice(offset + headerLength, offset + headerLength + length),
+    content: view.subarray(contentStart, contentStart + length), // zero-copy view
   };
 }
 
 function parseASN1Children(buffer) {
+  const view = toView(buffer);
   const children = [];
   let offset = 0;
-  const view = new Uint8Array(buffer);
 
   while (offset < view.length) {
-    const element = parseASN1(buffer, offset);
-    children.push({ ...element, contentOffset: undefined });
+    const element = parseASN1(view, offset);
+    children.push({
+      tag: element.tag,
+      length: element.length,
+      headerLength: element.headerLength,
+      totalLength: element.totalLength,
+      content: element.content,
+    });
     offset += element.totalLength;
   }
 
