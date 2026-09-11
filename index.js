@@ -53,6 +53,19 @@ const normalizeSerial = (serial) =>
 
 const normalizeFingerprint = (fp) => (fp || "").replace(/:/g, "").toLowerCase();
 
+// Revoked-serial sharding: FNV-1a hash -> bucket. Keeps the revocation set in a
+// fixed number of KV values instead of one key per serial, so large CRL imports
+// finish in a handful of parallel writes (no per-serial subrequest latency).
+const REVOKED_SHARDS = 256;
+function serialShardIndex(serial) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < serial.length; i++) {
+    h ^= serial.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % REVOKED_SHARDS;
+}
+
 // --- PEM / Base64 utilities ---
 
 function splitPEMBlocks(pem, type) {
@@ -522,6 +535,8 @@ async function processStreamedImport(stream, env, source) {
   const CRL_DATA = env.CRL_DATA;
   const CROSS_REF_MAX = 100000; // cap on in-memory serial list for cross-ref
 
+  const shardSets = new Map(); // shardIndex -> Set<normalized serial>
+
   const certs = [];
   const certsBySerial = new Map();
   const crlInfoList = [];
@@ -535,10 +550,12 @@ async function processStreamedImport(stream, env, source) {
   let crossRefComplete = true;
 
   // Clear strategy: wipe previous CRL-derived entries once, before streaming
-  const existingSerials = await REVOKED_CERTS.list({ prefix: "serial:" });
-  for (const key of existingSerials.keys) {
-    await REVOKED_CERTS.delete(key.name);
-    previousSerialsCleared++;
+  for (const prefix of ["serial:", "serialset:"]) {
+    const existingSerials = await REVOKED_CERTS.list({ prefix });
+    for (const key of existingSerials.keys) {
+      await REVOKED_CERTS.delete(key.name);
+      previousSerialsCleared++;
+    }
   }
   const existingFp = await REVOKED_CERTS.list({ prefix: "fingerprint:" });
   for (const key of existingFp.keys) {
@@ -573,18 +590,19 @@ async function processStreamedImport(stream, env, source) {
         } else {
           crossRefComplete = false;
         }
-        await REVOKED_CERTS.put(`serial:${normalized}`, JSON.stringify({
-          reason: "CRL import",
-          revokedAt: s.revocationDate || new Date().toISOString(),
-          issuerDN,
-          source,
-          importedAt: new Date().toISOString(),
-        }));
+        const idx = serialShardIndex(normalized);
+        if (!shardSets.has(idx)) shardSets.set(idx, new Set());
+        shardSets.get(idx).add(normalized);
         totalSerialsWritten++;
       }
       crlInfoList.push({ issuerDN, thisUpdate, nextUpdate, serialsFound: serials.length });
     }
   });
+
+  // Write the revocation set as shards: few parallel KV writes, no per-serial latency
+  await Promise.all([...shardSets].map(([idx, set]) =>
+    REVOKED_CERTS.put(`serialset:${idx}`, [...set].join("\n"))
+  ));
 
   // Order-independent cross-reference: revoked serial -> cert fingerprint
   const revokedSet = new Set(allRevokedSerials);
@@ -1198,7 +1216,12 @@ async function validateMTLS(request, REVOKED_CERTS) {
 
   if (certSerial) {
     const normalized = normalizeSerial(certSerial);
-    const revoked = await REVOKED_CERTS.get(`serial:${normalized}`);
+    // manual single-key revocation first, then the sharded CRL-import set
+    let revoked = await REVOKED_CERTS.get(`serial:${normalized}`);
+    if (!revoked) {
+      const shard = await REVOKED_CERTS.get(`serialset:${serialShardIndex(normalized)}`);
+      if (shard && shard.split("\n").includes(normalized)) revoked = true;
+    }
     if (revoked) {
       throw new Error(`Certificate revoked (serial: ${normalized})`);
     }
